@@ -52,7 +52,7 @@ module.exports = grammar({
 	// grammars are never linked into the same binary (this one is
 	// wasm-only, loaded directly by web-tree-sitter under a distinct
 	// filename), so the shared name causes no collision at runtime.
-	name: 'fennel',
+	name: 'fennel_sexp',
 
 	extras: $ => [
 		/\s/,
