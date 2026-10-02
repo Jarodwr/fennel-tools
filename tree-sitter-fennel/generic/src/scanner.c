@@ -142,19 +142,19 @@ static ScanResult scan_reader_macro(TSLexer *lexer, const bool skipped_hashfn) {
 	return SCAN_SUCCESS;
 }
 
-void* tree_sitter_fennel_external_scanner_create(void) {
+void* tree_sitter_fennel_sexp_external_scanner_create(void) {
 	return NULL;
 }
 
-void tree_sitter_fennel_external_scanner_destroy(void* payload) {}
+void tree_sitter_fennel_sexp_external_scanner_destroy(void* payload) {}
 
-unsigned tree_sitter_fennel_external_scanner_serialize(void* payload, char* buffer) {
+unsigned tree_sitter_fennel_sexp_external_scanner_serialize(void* payload, char* buffer) {
 	return 0;
 }
 
-void tree_sitter_fennel_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {}
+void tree_sitter_fennel_sexp_external_scanner_deserialize(void *payload, const char *buffer, unsigned length) {}
 
-ScanResult tree_sitter_fennel_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
+ScanResult tree_sitter_fennel_sexp_external_scanner_scan(void *payload, TSLexer *lexer, const bool *valid_symbols) {
 	if (in_error_recovery(valid_symbols)) {
 		return SCAN_STOP;
 	}
