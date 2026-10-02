@@ -8,7 +8,17 @@ description = "A language server for the Fennel programming language (Rust rewri
 name = "fennel-ls"
 path = "src/main.rs"
 
+[features]
+default = ["luajit"]
+luajit = ["mlua/luajit"]
+lua54 = ["mlua/lua54"]
+lua53 = ["mlua/lua53"]
+lua52 = ["mlua/lua52"]
+lua51 = ["mlua/lua51"]
+
 [dependencies]
+mlua = { version = "0.9", features = ["vendored", "serialize"] }
+full_moon = "2"
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -19,4 +29,6 @@ env_logger = "0.11"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+tempfile = "3"

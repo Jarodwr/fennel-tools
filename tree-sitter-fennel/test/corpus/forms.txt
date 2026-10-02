@@ -28,11 +28,10 @@ quote & unquote
           rhs: (symbol))))
   (local_form
     call: (symbol)
-    (binding_pair
-      lhs: (unquote_form
-        call: (symbol)
-        item: (symbol))
-      rhs: (symbol))))
+    lhs: (unquote_form
+      call: (symbol)
+      item: (symbol))
+    rhs: (symbol)))
 ===
 bindings + variable forms
 ===
@@ -51,17 +50,15 @@ bindings + variable forms
 (program
   (local_form
     call: (symbol)
-    (binding_pair
-      lhs: (symbol_binding)
-      rhs: (number)))
+    lhs: (symbol_binding)
+    rhs: (number))
   (var_form
     call: (symbol)
-    (binding_pair
-      lhs: (list_binding
-             item: (symbol_binding)
-             item: (symbol_binding)
-             item: (symbol_binding))
-      rhs: (number)))
+    lhs: (list_binding
+           item: (symbol_binding)
+           item: (symbol_binding)
+           item: (symbol_binding))
+    rhs: (number))
   (set_form
     call: (symbol)
     lhs: (sequence
@@ -78,44 +75,40 @@ bindings + variable forms
            expression: (nil)))
   (global_form
     call: (symbol)
-    (binding_pair
-      lhs: (sequence_binding
-            item: (symbol_binding)
-            item: (symbol_binding)
-            item: (rest_binding
-                    lhs: (symbol_option)
-                    rhs: (symbol_binding)))
-          rhs: (number)))
+    lhs: (sequence_binding
+           item: (symbol_binding)
+           item: (symbol_binding)
+           item: (rest_binding
+                   lhs: (symbol_option)
+                   rhs: (symbol_binding)))
+    rhs: (number))
   (local_form
     call: (symbol)
-    (binding_pair
-      lhs: (table_binding
-             item: (table_binding_pair
-                     key: (string_binding
-                            content: (string_content))
-                     value: (symbol_binding))
-             item: (table_binding_pair
-                     key: (symbol_binding)
-                     value: (symbol_binding))
-             item: (table_binding_pair
-                     key: (symbol_option)
-                     value: (symbol_binding)))
-      rhs: (number)))
+    lhs: (table_binding
+           item: (table_binding_pair
+                   key: (string_binding
+                          content: (string_content))
+                   value: (symbol_binding))
+           item: (table_binding_pair
+                   key: (symbol_binding)
+                   value: (symbol_binding))
+           item: (as_binding
+                   lhs: (symbol_option)
+                   rhs: (symbol_binding)))
+    rhs: (number))
   (local_form
     call: (symbol)
-    (binding_pair
-      lhs: (unquote_reader_macro
-             expression: (symbol))
-      rhs: (number)))
+    lhs: (unquote_reader_macro
+           expression: (symbol))
+    rhs: (number))
   (local_form
     call: (symbol)
-    (binding_pair
-      lhs: (unquote_reader_macro
-             expression: (list
-                           call: (symbol)
-                           item: (string
-                                   content: (string_content))))
-      rhs: (number))))
+    lhs: (unquote_reader_macro
+           expression: (list
+                         call: (symbol)
+                         item: (string
+                                 content: (string_content))))
+    rhs: (number)))
 
 ===
 let
@@ -295,21 +288,20 @@ function metadata
     docstring: (docstring
                  content: (string_content))
     metadata: (table_metadata
-                item: (table_metadata_pair
+                item: (table_pair
                         key: (string
                                content: (string_content))
-                        value: (sequence_arguments
-                                 item: (symbol_binding)
-                                 item: (symbol_binding)
-                                 item: (rest_binding
-                                         lhs: (symbol_option)
-                                         rhs: (symbol_binding))))
-                item: (table_metadata_pair
+                        value: (sequence
+                                 item: (symbol)
+                                 item: (symbol)
+                                 item: (symbol_option)
+                                 item: (symbol)))
+                item: (table_pair
                         key: (string
                                content: (string_content))
-                        value: (docstring
+                        value: (string
                                  content: (string_content)))
-                item: (table_metadata_pair
+                item: (table_pair
                         key: (string
                                content: (string_content))
                         value: (string
@@ -323,7 +315,7 @@ function metadata
             item: (symbol_binding)
             item: (symbol_binding))
     metadata: (table_metadata
-                item: (table_metadata_pair
+                item: (table_pair
                         key: (string
                                content: (string_content))
                         value: (string
@@ -380,9 +372,9 @@ case & match
     call: (symbol)
     item: (symbol)
     (case_pair
-      lhs: (list_binding
-             item: (symbol_binding)
-             item: (symbol_binding))
+      lhs: (pin_binding
+             call: (symbol)
+             target: (symbol))
       rhs: (number))
     (case_pair
       lhs: (list_binding
@@ -449,9 +441,9 @@ case & match
     call: (symbol)
     item: (symbol)
     (case_pair
-      lhs: (list_binding
-             item: (symbol_binding)
-             item: (symbol_binding))
+      lhs: (pin_binding
+             call: (symbol)
+             target: (symbol))
       rhs: (number))
     (case_pair
       lhs: (list_binding
@@ -556,9 +548,9 @@ case-try & match-try
       lhs: (list_binding
              item: (symbol_binding)
              item: (symbol_binding)
-             item: (list_binding
-                     item: (symbol_binding)
-                     item: (symbol_binding)))
+             item: (pin_binding
+                     call: (symbol)
+                     target: (symbol)))
       rhs: (list
              call: (multi_symbol
                      base: (symbol_fragment)
@@ -619,9 +611,9 @@ case-try & match-try
       lhs: (list_binding
              item: (symbol_binding)
              item: (symbol_binding)
-             item: (list_binding
-                     item: (symbol_binding)
-                     item: (symbol_binding)))
+             item: (pin_binding
+                     call: (symbol)
+                     target: (symbol)))
       rhs: (list
              call: (multi_symbol
                      base: (symbol_fragment)

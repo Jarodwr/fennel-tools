@@ -14,7 +14,7 @@ const forms = {};
 	'global',
 ].forEach(name => forms[name] = $ => form($,
 		name,
-		$.binding_pair,
+		pair($, { lhs: $._binding }, { rhs: $._sexp }),
 	)
 );
 
@@ -32,10 +32,14 @@ forms['let'] = $ => form($,
 	repeat(item($._sexp)),
 );
 
+// Per the reference, "import-macros can take any number of
+// binding/module-name pairs" — not just one.
 forms['import_macros'] = $ => form($,
 	'import-macros',
-	field('imports', $._binding),
-	field('module', $._sexp),
+	repeat1(seq(
+		field('imports', $._binding),
+		field('module', $._sexp),
+	)),
 );
 
 module.exports = {

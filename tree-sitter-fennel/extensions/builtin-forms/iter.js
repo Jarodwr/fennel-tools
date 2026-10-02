@@ -66,7 +66,7 @@ rules['_fiter_body'] = $ => prec.right(seq(
 rules['_for_iter_body'] = $ => sequence($._fiter_body);
 forms['for'] = $ => form($,
 	'for',
-	field('iter_body', alias($._fiter_body, $.for_iter_body) ),
+	field('iter_body', alias($._for_iter_body, $.for_iter_body) ),
 	repeat(item($._sexp)),
 );
 

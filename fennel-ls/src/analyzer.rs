@@ -35,6 +35,17 @@ pub struct DefinitionInfo {
     pub doc: Option<String>,
     /// True if the function accepts a rest arg (`& rest`) or varargs (`...`).
     pub variadic: bool,
+    /// True if the last body expression can produce multiple values (e.g. `(values ...)`).
+    /// Used to suppress false-positive arity warnings when this function is the last arg
+    /// in a call: Lua expands multi-return calls in tail-argument position.
+    pub returns_multiple: bool,
+    /// Static field names for table literals (`{:a 1 :b 2}` → `["a", "b"]`).
+    /// Only set when the binding is a table with all-literal keys. Used for field completions.
+    pub table_fields: Option<Vec<String>>,
+    /// For `DefKind::Macro` bindings: the module path from which this macro was
+    /// imported (e.g. `"addons.lua-gdextension.defnode"`). `None` for inline
+    /// `(macro ...)` / `(macros ...)` definitions.
+    pub source_module: Option<String>,
 }
 
 // ── Symbol reference ─────────────────────────────────────────────────────────
@@ -47,6 +58,10 @@ pub struct SymbolEntry {
     /// The byte offset of this symbol's definition, if known.
     pub def_byte: Option<u32>,
     pub is_def: bool,
+    /// True when this symbol appears inside the argument list of a macro call.
+    /// Unknown-identifier warnings are suppressed for these entries because macro
+    /// arguments are DSL forms that don't follow normal Fennel evaluation rules.
+    pub in_macro: bool,
 }
 
 // ── Scope ─────────────────────────────────────────────────────────────────────
@@ -64,6 +79,8 @@ pub struct Scope {
 pub struct AnalysisWarning {
     pub message: String,
     pub span: Span,
+    /// Span of the original definition, for shadow warnings.
+    pub related_span: Option<Span>,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +92,15 @@ pub struct AnalysisResult {
     pub syms: Vec<SymbolEntry>,
     pub scopes: Vec<Scope>,
     pub warnings: Vec<AnalysisWarning>,
+    /// Maps local binding name → required module name for `(local x (require :mod))`.
+    pub module_bindings: HashMap<String, String>,
+    /// Maps def-byte → required module name for require bindings (used for unused-require check).
+    pub require_def_bytes: HashMap<u32, String>,
+    /// Macro call sites found during analysis.
+    /// Each entry: (call_span_start, source_module, macro_name).
+    /// `source_module` is the module path from `import-macros`, or `None` for inline macros.
+    /// Used by the server to look up and execute the right hook.
+    pub macro_calls: Vec<(u32, Option<String>, String)>,
 }
 
 impl AnalysisResult {
@@ -111,7 +137,7 @@ impl AnalysisResult {
         while let Some(idx) = scope_idx {
             let scope = &self.scopes[idx];
             for (name, &def_byte) in &scope.bindings {
-                if seen.insert(name.clone()) {
+                if def_byte <= byte && seen.insert(name.clone()) {
                     if let Some(def) = self.defs.get(&def_byte) {
                         result.push(def);
                     }
@@ -139,6 +165,38 @@ impl AnalysisResult {
     }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// If `node` is `(require :mod)` or `(require "mod")`, return the module name.
+fn extract_require_module(node: &AstNode) -> Option<String> {
+    if let Form::List(forms) = &node.node {
+        if head_sym(forms) == Some("require") && forms.len() >= 2 {
+            return match &forms[1].node {
+                Form::Keyword(s) | Form::Str(s) => Some(s.clone()),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Extract static field names from a table literal.
+/// Returns keyword and string keys found in pairs; skips computed keys silently.
+/// An empty vec means either not a table or no static keys were found.
+fn extract_table_keys(node: &AstNode) -> Vec<String> {
+    let Form::Table(fields) = &node.node else { return vec![] };
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        match &fields[i].node {
+            Form::Keyword(k) | Form::Str(k) => keys.push(k.clone()),
+            _ => {}
+        }
+        i += 2;
+    }
+    keys
+}
+
 // ── Analyzer ─────────────────────────────────────────────────────────────────
 
 struct Analyzer {
@@ -147,6 +205,13 @@ struct Analyzer {
     scope_stack: Vec<usize>,
     /// Def-bytes of `var` bindings that appear as the target of at least one `set`.
     mutation_targets: std::collections::HashSet<u32>,
+    /// Nesting depth inside macro call argument lists.
+    /// While > 0, all emitted SymbolEntries are tagged `in_macro: true` and
+    /// unknown-identifier warnings are suppressed for them.
+    macro_depth: usize,
+    /// Hook results from a previous hook-runner pass, keyed by call_span_start.
+    /// When populated, the catch-all macro branch uses these instead of in_macro tagging.
+    hook_results: HashMap<u32, Vec<crate::hooks::Instruction>>,
 }
 
 impl Analyzer {
@@ -155,7 +220,13 @@ impl Analyzer {
             result: AnalysisResult::default(),
             scope_stack: Vec::new(),
             mutation_targets: std::collections::HashSet::new(),
+            macro_depth: 0,
+            hook_results: HashMap::new(),
         }
+    }
+
+    fn new_with_hooks(hook_results: HashMap<u32, Vec<crate::hooks::Instruction>>) -> Self {
+        Self { hook_results, ..Self::new() }
     }
 
     fn push_scope(&mut self, span: Span) -> usize {
@@ -190,6 +261,9 @@ impl Analyzer {
                 params,
                 doc,
                 variadic: false,
+                returns_multiple: false,
+                table_fields: None,
+                source_module: None,
             },
         );
         self.result.syms.push(SymbolEntry {
@@ -197,12 +271,16 @@ impl Analyzer {
             name: name.to_string(),
             def_byte: Some(byte),
             is_def: true,
+            in_macro: self.macro_depth > 0,
         });
         if let Some(scope_idx) = self.current_scope() {
             if name != "_" && self.result.scopes[scope_idx].bindings.contains_key(name) {
+                let orig_byte = self.result.scopes[scope_idx].bindings[name];
+                let related_span = self.result.defs.get(&orig_byte).map(|d| d.span.clone());
                 self.result.warnings.push(AnalysisWarning {
                     message: format!("`{}` is already defined in this scope", name),
                     span: span.clone(),
+                    related_span,
                 });
             }
             self.result.scopes[scope_idx]
@@ -226,6 +304,7 @@ impl Analyzer {
             name: name.to_string(),
             def_byte,
             is_def: false,
+            in_macro: self.macro_depth > 0,
         });
         if let (Some(db), Some(rb)) = (def_byte, Some(span.start)) {
             self.result.refs.insert(rb, db);
@@ -328,7 +407,7 @@ impl Analyzer {
                 if forms.len() >= 2 { self.analyze(&forms[1]); }
                 self.analyze_do(&forms[2..], list_span);
             }
-            Some("while") => self.analyze_while(forms),
+            Some("while") => self.analyze_while(forms, list_span),
             Some("each") => self.analyze_each(forms, list_span),
             Some("for") => self.analyze_for(forms, list_span),
             Some("macro") => self.analyze_macro_def(forms, list_span),
@@ -339,20 +418,101 @@ impl Analyzer {
             // collect / icollect / accumulate / faccumulate are iterator macros
             Some("collect") | Some("icollect") => self.analyze_collect(forms, list_span),
             Some("fcollect") => self.analyze_fcollect(forms, list_span),
-            Some("accumulate") | Some("faccumulate") => self.analyze_accumulate(forms, list_span),
+            Some("accumulate") => self.analyze_accumulate(forms, list_span),
+            Some("faccumulate") => self.analyze_faccumulate(forms, list_span),
             Some("with-open") => self.analyze_with_open(forms, list_span),
             Some("as->") => self.analyze_as_arrow(forms, list_span),
-            // Anything else: analyze head + args, then check arity
+            // Anything else: analyze head + args, then check arity.
+            // If the head resolves to a user-defined macro, record the call site and
+            // either execute cached hook instructions (giving full LSP support) or
+            // fall back to in_macro tagging (suppressing unknown-identifier warnings).
             _ => {
-                self.analyze_forms(forms);
-                self.check_arity(forms, list_span);
+                let macro_info = (|| -> Option<(String, Option<String>)> {
+                    let head_name = match &forms.first()?.node {
+                        Form::Symbol(s) => s.clone(),
+                        _ => return None,
+                    };
+                    let def_byte = self.lookup(&head_name)?;
+                    let def = self.result.defs.get(&def_byte)?;
+                    if matches!(def.kind, DefKind::Macro) {
+                        Some((head_name, def.source_module.clone()))
+                    } else {
+                        None
+                    }
+                })();
+
+                if let Some((macro_name, source_module)) = macro_info {
+                    self.result.macro_calls.push((list_span.start, source_module, macro_name.clone()));
+                    if let Some(head) = forms.first() {
+                        self.analyze(head);
+                    }
+                    if let Some(instrs) = self.hook_results.get(&list_span.start).cloned() {
+                        self.execute_hook_instructions(&instrs, forms);
+                    } else {
+                        self.macro_depth += 1;
+                        self.analyze_forms(&forms[1..]);
+                        self.macro_depth -= 1;
+                    }
+                } else {
+                    self.analyze_forms(forms);
+                    self.check_arity(forms, list_span);
+                }
+            }
+        }
+    }
+
+    /// Execute hook instructions for a macro call.
+    ///
+    /// `forms` is the full child list including the macro head at index 0.
+    /// Instruction indices are 1-based (matching Lua convention), so index N maps
+    /// to `forms[N-1]`.
+    fn execute_hook_instructions(&mut self, instructions: &[crate::hooks::Instruction], forms: &[AstNode]) {
+        use crate::hooks::Instruction;
+        for instr in instructions {
+            match instr {
+                Instruction::Bind { name, span } => {
+                    self.define(name, span, DefKind::Local, None, None);
+                }
+                Instruction::Analyze { index } => {
+                    if let Some(form) = forms.get(index - 1) {
+                        self.analyze(form);
+                    }
+                }
+                Instruction::AnalyzeFn { index } => {
+                    if let Some(form) = forms.get(index - 1) {
+                        if let Form::List(sub_forms) = &form.node {
+                            self.analyze_fn(sub_forms, &form.span);
+                        }
+                    }
+                }
+                Instruction::ScopeOpen { span } => {
+                    self.push_scope(span.clone());
+                }
+                Instruction::ScopeClose => {
+                    self.pop_scope();
+                }
+                Instruction::SubFormCompletions { .. } => {
+                    // TODO: store in AnalysisResult for position-based completion
+                }
+                Instruction::AnalyzeChildAt { parent, child } => {
+                    if let Some(parent_form) = forms.get(parent - 1) {
+                        let sub = match &parent_form.node {
+                            Form::List(ch) | Form::Sequence(ch) => Some(ch),
+                            _ => None,
+                        };
+                        if let Some(sub_node) = sub.and_then(|ch| ch.get(child - 1)) {
+                            self.analyze(sub_node);
+                        }
+                    }
+                }
             }
         }
     }
 
     /// Warn when a resolved function is called with the wrong number of arguments.
     fn check_arity(&mut self, forms: &[AstNode], list_span: &Span) {
-        let warn_msg = (|| -> Option<String> {
+        // Phase 1: collect callee info (all borrows released before phase 2).
+        let info = (|| -> Option<(String, usize)> {
             let head_name = match &forms.first()?.node {
                 Form::Symbol(s) => s.as_str(),
                 _ => return None,
@@ -363,25 +523,94 @@ impl Analyzer {
                 return None;
             }
             let expected = def.params.as_ref()?.len();
-            let actual = forms.len() - 1;
-            if actual != expected {
-                Some(format!(
-                    "`{}` expects {} argument{} but got {}",
-                    def.name,
-                    expected,
-                    if expected == 1 { "" } else { "s" },
-                    actual,
-                ))
-            } else {
-                None
-            }
+            Some((def.name.clone(), expected))
         })();
-        if let Some(msg) = warn_msg {
-            self.result.warnings.push(AnalysisWarning { message: msg, span: list_span.clone() });
+
+        let Some((fn_name, expected)) = info else { return };
+        let actual = forms.len() - 1;
+
+        if actual == expected {
+            return;
         }
+
+        // Under-arity: suppress when the last argument might expand to multiple
+        // values at runtime.  In Lua, a call in last-argument position expands
+        // to all of its return values, so `(f (multi-ret))` is valid even if
+        // `f` takes more than one parameter.
+        if actual < expected {
+            let last_may_expand = forms.last().map_or(false, |last| {
+                if tail_may_return_multiple(last) {
+                    return true;
+                }
+                if let Form::List(inner) = &last.node {
+                    if let Some(Form::Symbol(name)) = inner.first().map(|n| &n.node) {
+                        let root = name.split(['.', ':']).find(|s| !s.is_empty()).unwrap_or(name);
+                        if let Some(db) = self.lookup(root) {
+                            return self.result.defs.get(&db)
+                                .map_or(false, |d| d.returns_multiple);
+                        }
+                    }
+                }
+                false
+            });
+            if last_may_expand {
+                return;
+            }
+        }
+
+        self.result.warnings.push(AnalysisWarning {
+            message: format!(
+                "`{}` expects {} argument{} but got {}",
+                fn_name,
+                expected,
+                if expected == 1 { "" } else { "s" },
+                actual,
+            ),
+            span: list_span.clone(),
+            related_span: None,
+        });
     }
 
     // ── (local name val) / (var name val) / (global name val) ────────────────
+
+    /// Walk parent scopes and emit a warning if `name` is already bound in one.
+    /// Only called for explicit `local`/`var`/`let` bindings — not params or match patterns.
+    fn check_outer_shadow(&mut self, name: &str, span: &Span) {
+        if name.starts_with('_') {
+            return;
+        }
+        let current = match self.current_scope() {
+            Some(idx) => idx,
+            None => return,
+        };
+        let mut idx_opt = self.result.scopes[current].parent;
+        while let Some(idx) = idx_opt {
+            if let Some(&orig_byte) = self.result.scopes[idx].bindings.get(name) {
+                let related_span = self.result.defs.get(&orig_byte).map(|d| d.span.clone());
+                self.result.warnings.push(AnalysisWarning {
+                    message: format!("`{}` shadows a binding from an outer scope", name),
+                    span: span.clone(),
+                    related_span,
+                });
+                return;
+            }
+            idx_opt = self.result.scopes[idx].parent;
+        }
+    }
+
+    /// If `name_node` is a plain symbol and `rhs` is a table literal with static keys,
+    /// record those keys on the def so completions can offer `name.field`.
+    fn set_table_fields(&mut self, name_node: &AstNode, rhs: &AstNode) {
+        let Form::Symbol(_) = &name_node.node else { return };
+        let fields = extract_table_keys(rhs);
+        if fields.is_empty() {
+            return;
+        }
+        let byte = name_node.span.start;
+        if let Some(def) = self.result.defs.get_mut(&byte) {
+            def.table_fields = Some(fields);
+        }
+    }
 
     fn analyze_binding(&mut self, forms: &[AstNode], kind: DefKind) {
         if forms.len() < 3 {
@@ -389,7 +618,19 @@ impl Analyzer {
         }
         // Evaluate RHS first (so it doesn't see the new binding)
         self.analyze(&forms[2]);
+
+        if let Form::Symbol(name) = &forms[1].node {
+            // Cross-scope shadow check for explicit local/var
+            self.check_outer_shadow(name, &forms[1].span);
+            // Detect (local name (require :mod)) → record module bindings
+            if let Some(module) = extract_require_module(&forms[2]) {
+                self.result.module_bindings.insert(name.clone(), module.clone());
+                self.result.require_def_bytes.insert(forms[1].span.start, module);
+            }
+        }
         self.bind_pattern(&forms[1], kind);
+        // Record table shape for field completions
+        self.set_table_fields(&forms[1], &forms[2]);
     }
 
     // ── (set name val) ────────────────────────────────────────────────────────
@@ -410,6 +651,7 @@ impl Analyzer {
                                     def.name
                                 ),
                                 span: forms[1].span.clone(),
+                                related_span: None,
                             });
                         }
                         DefKind::Var => {
@@ -483,12 +725,16 @@ impl Analyzer {
             }
         }
 
-        // Patch the function's definition with param names and variadic flag
+        // Detect whether the last body expression may return multiple values.
+        let returns_multiple = body.last().map_or(false, tail_may_return_multiple);
+
+        // Patch the function's definition with param names, variadic flag, and return info.
         if let Some(db) = fn_def_byte {
             if let Some(def) = self.result.defs.get_mut(&db) {
                 def.params = Some(param_names.clone());
                 def.doc = doc.clone();
                 def.variadic = variadic;
+                def.returns_multiple = returns_multiple;
             }
         }
 
@@ -544,7 +790,12 @@ impl Analyzer {
             let mut i = 0;
             while i + 1 < bindings.len() {
                 self.analyze(&bindings[i + 1]);
+                // Cross-scope shadow check for plain symbol let-bindings
+                if let Form::Symbol(name) = &bindings[i].node {
+                    self.check_outer_shadow(name, &bindings[i].span);
+                }
                 self.bind_pattern(&bindings[i], DefKind::Local);
+                self.set_table_fields(&bindings[i], &bindings[i + 1]);
                 i += 2;
             }
         }
@@ -570,8 +821,14 @@ impl Analyzer {
 
     // ── (while cond body...) ──────────────────────────────────────────────────
 
-    fn analyze_while(&mut self, forms: &[AstNode]) {
-        self.analyze_forms(&forms[1..]);
+    fn analyze_while(&mut self, forms: &[AstNode], list_span: &Span) {
+        // (while condition body...)
+        // Condition is in the outer scope; body gets its own scope.
+        if forms.len() < 2 { return; }
+        self.analyze(&forms[1]);
+        self.push_scope(list_span.clone());
+        self.analyze_forms(&forms[2..]);
+        self.pop_scope();
     }
 
     // ── (each [k v iter] body...) ─────────────────────────────────────────────
@@ -612,18 +869,22 @@ impl Analyzer {
     // ── (for [i start stop step?] body...) ────────────────────────────────────
 
     fn analyze_for(&mut self, forms: &[AstNode], list_span: &Span) {
-        // (for var start stop [step] body...)
-        // var is forms[1] directly — NOT wrapped in a Sequence.
-        if forms.len() < 4 {
+        // (for [var start stop step?] body...)
+        // The binding clause is always a Sequence at forms[1].
+        if forms.len() < 3 {
             return;
         }
         self.push_scope(list_span.clone());
-        // Analyze start and stop before binding (they must not reference the var)
-        self.analyze(&forms[2]);
-        self.analyze(&forms[3]);
-        self.bind_pattern(&forms[1], DefKind::LoopVar);
-        // Remaining forms: optional step, then body — var is in scope for all
-        self.analyze_forms(&forms[4..]);
+        if let Form::Sequence(binds) = &forms[1].node {
+            if binds.len() >= 3 {
+                // Analyze start, stop, and optional step before binding the var.
+                for expr in &binds[1..] {
+                    self.analyze(expr);
+                }
+                self.bind_pattern(&binds[0], DefKind::LoopVar);
+            }
+        }
+        self.analyze_forms(&forms[2..]);
         self.pop_scope();
     }
 
@@ -668,16 +929,37 @@ impl Analyzer {
         if forms.len() < 2 {
             return;
         }
+        // Extract the module path string (forms[2] is the module argument).
+        let source_module: Option<String> = forms.get(2).and_then(|n| match &n.node {
+            Form::Keyword(s) | Form::Str(s) => Some(s.clone()),
+            _ => None,
+        });
+
         if let Form::Table(fields) = &forms[1].node {
             let mut i = 0;
-            while i + 1 < fields.len() {
-                // The VALUE (i+1) is always the local binding name:
-                //   {: foo}         → [sym(":"), sym("foo")]  → bind "foo"
-                //   {:remote local} → [kw(...), sym("local")] → bind "local"
-                if let Form::Symbol(name) = &fields[i + 1].node {
-                    self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+            while i < fields.len() {
+                if i + 1 < fields.len() {
+                    // Paired element — binding name is always at fields[i+1]:
+                    //   {: foo}         → [sym(":"), sym("foo")]  → bind "foo"
+                    //   {:remote local} → [kw(...), sym("local")] → bind "local"
+                    if let Form::Symbol(name) = &fields[i + 1].node {
+                        let byte = self.define(name, &fields[i + 1].span, DefKind::Macro, None, None);
+                        if let Some(def) = self.result.defs.get_mut(&byte) {
+                            def.source_module = source_module.clone();
+                        }
+                    }
+                    i += 2;
+                } else {
+                    // Standalone trailing symbol — shorthand for {: name}:
+                    //   {defnode}  →  bind "defnode"
+                    if let Form::Symbol(name) = &fields[i].node {
+                        let byte = self.define(name, &fields[i].span, DefKind::Macro, None, None);
+                        if let Some(def) = self.result.defs.get_mut(&byte) {
+                            def.source_module = source_module.clone();
+                        }
+                    }
+                    i += 1;
                 }
-                i += 2;
             }
         }
     }
@@ -869,6 +1151,37 @@ impl Analyzer {
                 }
 
                 // Analyze the &until guard (its condition can reference loop vars)
+                if let Some(p) = until_pos {
+                    if p + 1 < binds.len() {
+                        self.analyze(&binds[p + 1]);
+                    }
+                }
+            }
+        }
+        self.analyze_forms(&forms[2..]);
+        self.pop_scope();
+    }
+
+    fn analyze_faccumulate(&mut self, forms: &[AstNode], list_span: &Span) {
+        // (faccumulate [acc init var start stop step? &until cond?] body)
+        // Unlike accumulate, the range elements (start/stop/step) are numeric
+        // expressions, not loop-var patterns — they must be analyzed, not bound.
+        if forms.len() < 2 { return; }
+        self.push_scope(list_span.clone());
+        if let Form::Sequence(binds) = &forms[1].node {
+            if binds.len() >= 5 {
+                let until_pos = binds.iter().position(|b| {
+                    matches!(&b.node, Form::Symbol(s) if s == "&until")
+                });
+                let range_end = until_pos.unwrap_or(binds.len());
+                // Analyze init before binding acc
+                self.analyze(&binds[1]);
+                self.bind_pattern(&binds[0], DefKind::Local);
+                // Analyze start/stop/step before binding the loop var
+                for expr in &binds[3..range_end] {
+                    self.analyze(expr);
+                }
+                self.bind_pattern(&binds[2], DefKind::LoopVar);
                 if let Some(p) = until_pos {
                     if p + 1 < binds.len() {
                         self.analyze(&binds[p + 1]);
@@ -1147,10 +1460,43 @@ impl Analyzer {
     }
 }
 
+// ── Multi-value return detection ──────────────────────────────────────────────
+
+/// Returns true when `node`, evaluated in tail position, may produce multiple
+/// values.  Used to suppress false-positive arity warnings: Lua expands a
+/// multi-return call that appears as the *last* argument in a call site.
+fn tail_may_return_multiple(node: &AstNode) -> bool {
+    match &node.node {
+        Form::List(forms) => match head_sym(forms) {
+            Some("values") => true,
+            Some("do") | Some("when") | Some("unless") => {
+                forms.last().map_or(false, tail_may_return_multiple)
+            }
+            Some("let") | Some("with-open") => {
+                forms.last().map_or(false, tail_may_return_multiple)
+            }
+            Some("if") => {
+                forms.get(2).map_or(false, tail_may_return_multiple)
+                    || forms.get(3).map_or(false, tail_may_return_multiple)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
-    let mut analyzer = Analyzer::new();
+    analyze_with_hooks(ast, &HashMap::new(), &HashMap::new())
+}
+
+pub fn analyze_with_hooks(
+    ast: &[AstNode],
+    hook_results: &HashMap<u32, Vec<crate::hooks::Instruction>>,
+    global_macros: &HashMap<String, String>,
+) -> AnalysisResult {
+    let mut analyzer = Analyzer::new_with_hooks(hook_results.clone());
 
     // Global scope covering the entire file (span 0..u32::MAX is fine)
     let global_span = if let (Some(first), Some(last)) = (ast.first(), ast.last()) {
@@ -1163,6 +1509,18 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         end: u32::MAX,
         ..global_span
     });
+
+    // Pre-define global macros in the root scope so they're visible in every
+    // file without an explicit (import-macros ...). Synthetic byte offsets
+    // (u32::MAX - i) place them outside any real source range.
+    for (i, (name, source_module)) in global_macros.iter().enumerate() {
+        let synthetic_byte = u32::MAX - i as u32;
+        let span = Span { start: synthetic_byte, end: synthetic_byte, line: 0, col: 0, end_line: 0, end_col: 0 };
+        let byte = analyzer.define(name, &span, DefKind::Macro, None, None);
+        if let Some(def) = analyzer.result.defs.get_mut(&byte) {
+            def.source_module = Some(source_module.clone());
+        }
+    }
 
     analyzer.analyze_forms(ast);
 
@@ -1177,6 +1535,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("`{}` is never mutated; use `local` instead of `var`", name),
             span,
+            related_span: None,
         });
     }
 
@@ -1184,14 +1543,31 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
     let referenced: std::collections::HashSet<u32> =
         analyzer.result.refs.values().copied().collect();
 
+    // Warn on require bindings that are never used.
+    let unused_requires: Vec<(String, String, Span)> = analyzer.result.require_def_bytes.iter()
+        .filter(|(&db, _)| !referenced.contains(&db))
+        .filter_map(|(&db, module)| {
+            analyzer.result.defs.get(&db)
+                .map(|def| (def.name.clone(), module.clone(), def.span.clone()))
+        })
+        .collect();
+    for (name, module, span) in unused_requires {
+        analyzer.result.warnings.push(AnalysisWarning {
+            message: format!("`{}` (require :{}) is required but never used", name, module),
+            span,
+            related_span: None,
+        });
+    }
+
     // Warn on `local` bindings that are never read.
-    // Skips `_`-prefixed names (conventional discard) and destructured bindings
-    // (too noisy when only some fields of a table are used).
+    // Skips `_`-prefixed names (conventional discard), destructured bindings,
+    // and require bindings (those get their own message above).
     let unused_locals: Vec<(String, Span)> = analyzer.result.defs.iter()
         .filter(|(&db, def)| {
             def.kind == DefKind::Local
                 && !referenced.contains(&db)
                 && !def.name.starts_with('_')
+                && !analyzer.result.require_def_bytes.contains_key(&db)
         })
         .map(|(_, def)| (def.name.clone(), def.span.clone()))
         .collect();
@@ -1199,6 +1575,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("`{}` is defined but never used", name),
             span,
+            related_span: None,
         });
     }
 
@@ -1210,6 +1587,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
                 && !referenced.contains(&db)
                 && !def.name.starts_with('_')
                 && !def.name.starts_with('<')
+                && !def.name.starts_with('$')
         })
         .map(|(_, def)| (def.name.clone(), def.span.clone()))
         .collect();
@@ -1217,6 +1595,7 @@ pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
         analyzer.result.warnings.push(AnalysisWarning {
             message: format!("parameter `{}` is unused", name),
             span,
+            related_span: None,
         });
     }
 
@@ -1292,6 +1671,13 @@ mod tests {
     }
 
     #[test]
+    fn hashfn_unused_dollar_params_no_warn() {
+        // $2..$9 are pre-declared for every hashfn but unused ones must not warn
+        assert!(!has_warning("#(+ $ 1)", "unused"));
+        assert!(!has_warning("#(+ $1 $2)", "unused"));
+    }
+
+    #[test]
     fn var_in_inner_scope_unwarn_if_set() {
         assert!(!has_warning("(do (var x 1) (set x 2) x)", "never mutated"));
     }
@@ -1314,13 +1700,43 @@ mod tests {
     }
 
     #[test]
-    fn parent_scope_shadow_no_warn() {
+    fn same_scope_shadow_still_warns_already_defined() {
+        // Same-scope re-definition keeps the original "already defined" message.
         assert!(!has_warning("(local x 1) (let [] (local x 2) x) x", "already defined"));
     }
 
     #[test]
     fn underscore_no_shadow_warn() {
         assert!(!has_warning("(let [_ 1 _ 2] nil)", "already defined"));
+    }
+
+    // ── Cross-scope shadowing ─────────────────────────────────────────────────
+
+    #[test]
+    fn outer_scope_shadow_warns() {
+        assert!(has_warning("(local x 1) (do (local x 2) x) x", "shadows a binding from an outer scope"));
+    }
+
+    #[test]
+    fn let_binding_outer_shadow_warns() {
+        assert!(has_warning("(local x 1) (let [x 2] x)", "shadows a binding from an outer scope"));
+    }
+
+    #[test]
+    fn fn_param_outer_shadow_no_warn() {
+        // Function params are not checked — too noisy and idiomatic to reuse names.
+        assert!(!has_warning("(local x 1) (fn f [x] x)", "shadows"));
+    }
+
+    #[test]
+    fn loop_var_outer_shadow_no_warn() {
+        // Loop vars (each/for) are also not checked.
+        assert!(!has_warning("(local x 1) (each [x []] x)", "shadows"));
+    }
+
+    #[test]
+    fn underscore_outer_shadow_no_warn() {
+        assert!(!has_warning("(local _ 1) (do (local _ 2) nil)", "shadows"));
     }
 
     #[test]
@@ -1559,36 +1975,32 @@ mod tests {
 
     #[test]
     fn for_binds_loop_var() {
-        let r = analyze_src("(for i 1 10 (print i))");
+        let r = analyze_src("(for [i 1 10] (print i))");
         assert_eq!(def_kind(&r, "i"), Some(DefKind::LoopVar));
         assert!(!is_unknown(&r, "i"));
     }
 
     #[test]
     fn for_var_in_scope_in_body() {
-        // i must be a resolved reference inside the body, not unknown
-        let r = analyze_src("(for i 1 5 (io.write (tostring i)))");
+        let r = analyze_src("(for [i 1 5] (io.write (tostring i)))");
         assert!(!is_unknown(&r, "i"), "loop var must be visible in body");
-        assert!(!is_unknown(&r, "i"), "body reference to i must resolve");
     }
 
     #[test]
     fn for_with_step_var_in_scope() {
-        // step is the 5th form; body still has i in scope
-        let r = analyze_src("(for i 0 100 10 (print i))");
+        let r = analyze_src("(for [i 0 100 10] (print i))");
         assert!(!is_unknown(&r, "i"), "loop var must be visible when step is present");
     }
 
     #[test]
     fn for_var_not_in_scope_outside() {
-        let r = analyze_src("(for i 1 3 nil) i");
+        let r = analyze_src("(for [i 1 3] nil) i");
         assert!(is_unknown(&r, "i"), "loop var must not leak outside for");
     }
 
     #[test]
     fn for_start_stop_analyzed() {
-        // start and stop are expressions; references inside them should resolve
-        let r = analyze_src("(local n 10) (for i 1 n (print i))");
+        let r = analyze_src("(local n 10) (for [i 1 n] (print i))");
         assert!(!is_unknown(&r, "n"), "stop expression must be analyzed");
     }
 
@@ -2003,6 +2415,35 @@ mod tests {
     }
 
     #[test]
+    fn faccumulate_variable_start_stop_analyzed_as_exprs() {
+        let r = analyze_src("(local lo 1) (local hi 10) (faccumulate [sum 0 i lo hi] (+ sum i))");
+        assert!(!is_unknown(&r, "lo"), "start must be analyzed as an expression");
+        assert!(!is_unknown(&r, "hi"), "stop must be analyzed as an expression");
+        assert!(!is_unknown(&r, "i"), "loop var must be visible in body");
+        assert!(!is_unknown(&r, "sum"), "acc must be visible in body");
+    }
+
+    #[test]
+    fn faccumulate_variable_step_analyzed_as_expr() {
+        let r = analyze_src("(local step 2) (faccumulate [sum 0 i 1 10 step] (+ sum i))");
+        assert!(!is_unknown(&r, "step"), "step must be analyzed as an expression");
+        assert!(!is_unknown(&r, "i"));
+    }
+
+    #[test]
+    fn faccumulate_until_guard_sees_loop_var() {
+        let r = analyze_src("(faccumulate [sum 0 i 1 100 &until (> sum 50)] (+ sum i))");
+        assert!(!is_unknown(&r, "i"), "loop var must be visible in &until guard");
+        assert!(!is_unknown(&r, "sum"), "acc must be visible in &until guard");
+    }
+
+    #[test]
+    fn faccumulate_acc_not_visible_outside() {
+        let r = analyze_src("(faccumulate [sum 0 i 1 10] (+ sum i)) sum");
+        assert!(is_unknown(&r, "sum"), "acc must not leak outside faccumulate");
+    }
+
+    #[test]
     fn lambda_creates_fn_def() {
         let r = analyze_src("(lambda greet [name] name)");
         assert_eq!(def_kind(&r, "greet"), Some(DefKind::Fn));
@@ -2021,6 +2462,237 @@ mod tests {
         // `(macros {name (fn [x] x)})` — bare symbol keys, not keyword keys
         let r = analyze_src("(macros {my-mac (fn [x] x)})");
         assert_eq!(def_kind(&r, "my-mac"), Some(DefKind::Macro));
+    }
+
+    #[test]
+    fn macro_form_call_site_not_unknown() {
+        // (macro ...) creates a def; the call site should resolve, not be flagged.
+        let r = analyze_src("(macro my-mac [x] x) (my-mac 1)");
+        assert!(!is_unknown(&r, "my-mac"), "macro call site must resolve");
+    }
+
+    #[test]
+    fn macros_form_call_site_not_unknown() {
+        // (macros {...}) also creates defs; call sites must resolve.
+        let r = analyze_src("(macros {my-mac (fn [x] x)}) (my-mac 99)");
+        assert!(!is_unknown(&r, "my-mac"), "macros-form call site must resolve");
+    }
+
+    #[test]
+    fn import_macros_call_site_not_unknown() {
+        // (import-macros {: foo} :lib) creates a def for `foo`; calling it must resolve.
+        let r = analyze_src("(import-macros {: foo :bar baz} :mylib) (foo 1) (baz 2)");
+        assert!(!is_unknown(&r, "foo"), "import-macros call site `foo` must resolve");
+        assert!(!is_unknown(&r, "baz"), "import-macros call site `baz` must resolve");
+    }
+
+    #[test]
+    fn import_macros_standalone_shorthand_binds() {
+        // {defnode} without a preceding colon should bind "defnode"
+        let r = analyze_src("(import-macros {defnode} :mylib)");
+        assert_eq!(def_kind(&r, "defnode"), Some(DefKind::Macro));
+    }
+
+    #[test]
+    fn macro_call_dsl_args_not_unknown() {
+        // DSL symbols in macro argument position must not be flagged as unknown
+        let r = analyze_src(
+            "(import-macros {defnode} :mylib) (defnode FennelNode (extends Base) (tool))"
+        );
+        let dsl_syms: Vec<_> = r.syms.iter()
+            .filter(|s| ["FennelNode", "extends", "Base", "tool"].contains(&s.name.as_str()))
+            .collect();
+        for s in &dsl_syms {
+            assert!(s.in_macro, "`{}` should be tagged in_macro", s.name);
+        }
+    }
+
+    #[test]
+    fn macro_call_nested_fn_params_resolve() {
+        // Inside a macro call, a (fn ...) sub-form should still bind its params
+        let r = analyze_src(
+            "(import-macros {defnode} :mylib) (defnode Foo (fn greet [self x] x))"
+        );
+        // `x` inside the fn should resolve to its param — def_byte not None
+        let x_ref = r.syms.iter()
+            .find(|s| s.name == "x" && !s.is_def)
+            .expect("x reference");
+        assert!(x_ref.def_byte.is_some(), "x should resolve to its param def");
+    }
+
+    // ── source_module on import-macros defs ──────────────────────────────────
+
+    fn source_module_of(r: &AnalysisResult, name: &str) -> Option<String> {
+        r.defs.values()
+            .find(|d| d.name == name && d.kind == DefKind::Macro)
+            .and_then(|d| d.source_module.clone())
+    }
+
+    #[test]
+    fn import_macros_keyword_module_stored_on_def() {
+        let r = analyze_src("(import-macros {: defnode} :addons.lua-gdextension.defnode)");
+        assert_eq!(
+            source_module_of(&r, "defnode").as_deref(),
+            Some("addons.lua-gdextension.defnode"),
+            "source_module should be the keyword module path"
+        );
+    }
+
+    #[test]
+    fn import_macros_string_module_stored_on_def() {
+        let r = analyze_src(r#"(import-macros {: defnode} "addons.lua-gdextension.defnode")"#);
+        assert_eq!(
+            source_module_of(&r, "defnode").as_deref(),
+            Some("addons.lua-gdextension.defnode")
+        );
+    }
+
+    #[test]
+    fn import_macros_standalone_shorthand_stores_module() {
+        let r = analyze_src("(import-macros {defnode} :mylib)");
+        assert_eq!(source_module_of(&r, "defnode").as_deref(), Some("mylib"));
+    }
+
+    #[test]
+    fn inline_macro_has_no_source_module() {
+        let r = analyze_src("(macro my-mac [x] `(local ,x nil))");
+        assert_eq!(source_module_of(&r, "my-mac"), None,
+            "inline macro should have no source_module");
+    }
+
+    #[test]
+    fn macros_form_has_no_source_module() {
+        let r = analyze_src("(macros {:my-mac (fn [x] `(local ,x nil))})");
+        assert_eq!(source_module_of(&r, "my-mac"), None);
+    }
+
+    // ── macro_calls tracking ─────────────────────────────────────────────────
+
+    #[test]
+    fn macro_calls_populated_for_import_macros_call() {
+        let r = analyze_src(
+            "(import-macros {: defnode} :mylib) (defnode Foo (extends Bar))"
+        );
+        let call = r.macro_calls.iter()
+            .find(|(_, _, name)| name == "defnode")
+            .expect("defnode call should be recorded");
+        assert_eq!(call.1.as_deref(), Some("mylib"), "source_module should be mylib");
+    }
+
+    #[test]
+    fn macro_calls_has_none_source_module_for_inline_macro() {
+        let r = analyze_src("(macro m [x] `(local ,x 1)) (m foo)");
+        let call = r.macro_calls.iter()
+            .find(|(_, _, name)| name == "m")
+            .expect("m call should be recorded");
+        assert!(call.1.is_none(), "inline macro call should have None source_module");
+    }
+
+    #[test]
+    fn macro_calls_not_populated_for_regular_functions() {
+        let r = analyze_src("(fn greet [x] x) (greet 42)");
+        assert!(r.macro_calls.is_empty(), "regular fn calls should not appear in macro_calls");
+    }
+
+    // ── analyze_with_hooks: instruction execution ─────────────────────────────
+
+    fn make_hook_results(span_start: u32, instrs: Vec<crate::hooks::Instruction>) -> HashMap<u32, Vec<crate::hooks::Instruction>> {
+        let mut m = HashMap::new();
+        m.insert(span_start, instrs);
+        m
+    }
+
+    #[test]
+    fn hook_bind_instruction_introduces_def() {
+        // Without a hook, FennelNode3D would be in_macro.
+        // With a Bind instruction it should be a real Local def.
+        let src = "(import-macros {: defnode} :mylib) (defnode FennelNode3D)";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        // Find the span of the defnode call
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // Build the span for "FennelNode3D" — it follows "defnode " at the call site
+        let name_span = first_pass.syms.iter()
+            .find(|s| s.name == "FennelNode3D")
+            .map(|s| s.span.clone())
+            .expect("FennelNode3D sym");
+
+        let hook_results = make_hook_results(call_span, vec![
+            crate::hooks::Instruction::Bind {
+                name: "FennelNode3D".into(),
+                span: name_span,
+            },
+        ]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+
+        // Should be a proper def now, not in_macro
+        let def = second_pass.defs.values()
+            .find(|d| d.name == "FennelNode3D")
+            .expect("FennelNode3D def");
+        assert_eq!(def.kind, DefKind::Local);
+
+        let sym = second_pass.syms.iter()
+            .find(|s| s.name == "FennelNode3D" && s.is_def)
+            .expect("FennelNode3D sym entry");
+        assert!(!sym.in_macro, "bound name should not be tagged in_macro");
+    }
+
+    #[test]
+    fn hook_analyze_fn_instruction_binds_fn_name_and_params() {
+        // (import-macros {: defnode} :mylib)
+        // (defnode Foo (fn greet [self x] x))
+        // With AnalyzeFn on the (fn ...) child, greet and self/x should be real defs.
+        let src = "(import-macros {: defnode} :mylib) (defnode Foo (fn greet [self x] x))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // The (fn greet ...) form is at index 2 of the defnode call (1-based: index 3).
+        // In forms[], that's forms[2] (0-based). AnalyzeFn { index: 3 } → forms[2].
+        let hook_results = make_hook_results(call_span, vec![
+            crate::hooks::Instruction::AnalyzeFn { index: 3 },
+        ]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+
+        assert!(has_def(&second_pass, "greet"), "greet should be a def via AnalyzeFn");
+        assert_eq!(def_kind(&second_pass, "greet"), Some(DefKind::Fn));
+        assert!(has_def(&second_pass, "self"), "self param should be a def");
+        assert!(has_def(&second_pass, "x"), "x param should be a def");
+        // x in the body should resolve to the param
+        assert!(!is_unknown(&second_pass, "x"), "x in body should resolve");
+    }
+
+    #[test]
+    fn hook_instructions_suppress_in_macro_tagging() {
+        // When a hook is provided, forms handled by it should NOT be in_macro.
+        // Forms not mentioned remain unanalyzed (no SymbolEntry at all).
+        let src = "(import-macros {: defnode} :mylib) (defnode Foo (extends Base))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let first_pass = analyze(&ast);
+
+        let call_span = first_pass.macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call");
+
+        // Hook provides no instructions (empty vec = hook present, skip all args)
+        let hook_results = make_hook_results(call_span, vec![]);
+        let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+
+        // extends and Base should not appear in syms (not analyzed at all)
+        let base_syms: Vec<_> = second_pass.syms.iter()
+            .filter(|s| s.name == "Base")
+            .collect();
+        assert!(base_syms.is_empty(), "Base should not be in syms when hook skips it");
     }
 
     // ── Destructuring edge cases ──────────────────────────────────────────────
@@ -2103,9 +2775,35 @@ mod tests {
 
     #[test]
     fn when_body_refs_resolve() {
-        // Refs inside the when body can see outer bindings.
         let r = analyze_src("(local x 1) (when true x)");
         assert!(ref_resolves(&r, "x"), "body ref to outer binding must resolve");
+    }
+
+    // ── while ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn while_condition_refs_resolve() {
+        let r = analyze_src("(local n 10) (while (> n 0) nil)");
+        assert!(!is_unknown(&r, "n"), "condition must see outer bindings");
+    }
+
+    #[test]
+    fn while_body_refs_resolve() {
+        let r = analyze_src("(local x 1) (while true (print x))");
+        assert!(!is_unknown(&r, "x"), "body must see outer bindings");
+    }
+
+    #[test]
+    fn while_body_binding_not_visible_after_while() {
+        let r = analyze_src("(while true (local inner 1)) inner");
+        assert!(is_unknown(&r, "inner"), "while body binding must not leak outside");
+    }
+
+    #[test]
+    fn while_body_multiple_forms_all_analyzed() {
+        let r = analyze_src("(local a 1) (local b 2) (while true (print a) (print b))");
+        assert!(!is_unknown(&r, "a"));
+        assert!(!is_unknown(&r, "b"));
     }
 
     // ── Global scope limitation ───────────────────────────────────────────────
@@ -2270,10 +2968,8 @@ mod tests {
 
     #[test]
     fn for_step_expression_analyzed() {
-        // Step is the 5th form: (for var start stop step body...)
-        // It is analyzed inside the for scope, so outer locals must resolve.
-        let r = analyze_src("(local step 2) (for i 1 10 step (print i))");
-        assert!(!is_unknown(&r, "step"), "step variable must resolve in for body");
+        let r = analyze_src("(local step 2) (for [i 1 10 step] (print i))");
+        assert!(!is_unknown(&r, "step"), "step variable must resolve in for bindings");
         assert!(!is_unknown(&r, "i"), "loop var must be visible alongside step");
     }
 
@@ -2403,6 +3099,34 @@ mod tests {
     }
 
     #[test]
+    fn bare_underscore_in_body_not_unknown() {
+        // `_` is a builtin discard. Referencing it in body position should not
+        // produce an "unknown identifier" warning. It IS unusual code (you normally
+        // don't read a discard), but the LSP should not emit a spurious diagnostic.
+        let r = analyze_src("(fn f [_] _)");
+        assert!(!is_unknown(&r, "_"),
+            "_ in body must not be flagged as unknown identifier");
+    }
+
+    #[test]
+    fn multiple_underscore_params_no_shadow_warning() {
+        // (fn f [_ _] nil) — two _ params: no shadow warning, no unused warning.
+        assert!(!has_warning("(fn f [_ _] nil)", "already defined"),
+            "multiple _ params must not trigger shadow warning");
+        assert!(!has_warning("(fn f [_ _] nil)", "parameter"),
+            "_ params must not trigger unused-param warning");
+    }
+
+    #[test]
+    fn underscore_loop_var_no_warning() {
+        // (each [_ v (ipairs t)] v) — _ discards the key, v is used.
+        assert!(!has_warning("(each [_ v (ipairs t)] v)", "unused"),
+            "_ loop var must not trigger unused warning");
+        assert!(!is_unknown(&analyze_src("(each [_ v (ipairs t)] v)"), "_"),
+            "_ loop var must not trigger unknown-identifier");
+    }
+
+    #[test]
     fn multiple_params_one_unused_warns_correctly() {
         let r = analyze_src("(fn f [a b] a)");
         assert!(r.warnings.iter().any(|w| w.message.contains("`b`") && w.message.contains("unused")),
@@ -2466,5 +3190,195 @@ mod tests {
     fn arity_recursive_call_no_false_warn() {
         // `(fn fact [n] (fact n))` — 1 arg, 1 param: no warning
         assert!(!has_warning("(fn fact [n] (fact n))", "argument"));
+    }
+
+    #[test]
+    fn arity_values_direct_as_last_arg_suppressed() {
+        // (values 1 2) in last-arg position expands at runtime → no warning
+        assert!(!has_warning("(fn f [a b] nil) (f (values 1 2))", "argument"));
+    }
+
+    #[test]
+    fn arity_values_with_explicit_first_arg_suppressed() {
+        // (f x (values 1 2)) where f takes 3 params: x fills slot 1, values fills 2+3
+        assert!(!has_warning("(fn f [a b c] nil) (local x 1) (f x (values 1 2))", "argument"));
+    }
+
+    #[test]
+    fn arity_multi_return_fn_suppresses_under_arity() {
+        // (fn pair [] (values 1 2)) is the last arg — its expansion may satisfy arity
+        assert!(!has_warning(
+            "(fn pair [] (values 1 2)) (fn add [a b] nil) (add (pair))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_multi_return_fn_with_leading_arg_suppressed() {
+        // (add x (pair)) — x fills slot 1, pair expands to fill slots 2+3
+        assert!(!has_warning(
+            "(fn pair [] (values 1 2)) (fn add [a b c] nil) (local x 1) (add x (pair))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_single_return_fn_still_warns() {
+        // (fn f [] nil) returns one value; (g (f)) with g taking 2 should still warn
+        assert!(has_warning(
+            "(fn f [] nil) (fn g [a b] nil) (g (f))",
+            "expects 2 arguments but got 1",
+        ));
+    }
+
+    #[test]
+    fn arity_over_supply_always_warns_regardless_of_multi_return() {
+        // Too many explicit args is always wrong, even if last arg is multi-return
+        assert!(has_warning(
+            "(fn pair [] (values 1 2)) (fn f [a] nil) (local x 1) (f x (pair))",
+            "expects 1 argument but got 2",
+        ));
+    }
+
+    #[test]
+    fn arity_values_in_do_body_marks_returns_multiple() {
+        // A fn whose body is (do (values 1 2)) also propagates returns_multiple
+        assert!(!has_warning(
+            "(fn f [] (do (values 1 2))) (fn g [a b] nil) (g (f))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_values_in_if_branch_marks_returns_multiple() {
+        // Both branches return multiple values → returns_multiple
+        assert!(!has_warning(
+            "(fn f [x] (if x (values 1 2) (values 3 4))) (fn g [a b] nil) (g (f true))",
+            "argument",
+        ));
+    }
+
+    #[test]
+    fn arity_non_last_arg_multi_return_still_warns() {
+        // Lua truncates non-last arguments to 1 value; (pair) in non-last position
+        // does NOT expand, so the count is still wrong.
+        // (f (pair) x) where f takes 3: pair is truncated to 1, x is 1 → actual=2, expected=3
+        assert!(has_warning(
+            "(fn pair [] (values 1 2)) (fn f [a b c] nil) (local x 1) (f (pair) x)",
+            "expects 3 arguments but got 2",
+        ));
+    }
+
+    // ── module_bindings ───────────────────────────────────────────────────────
+
+    #[test]
+    fn module_binding_keyword_arg() {
+        let r = analyze_src("(local utils (require :my.mod))");
+        assert_eq!(r.module_bindings.get("utils").map(|s| s.as_str()), Some("my.mod"));
+    }
+
+    #[test]
+    fn module_binding_string_arg() {
+        let r = analyze_src(r#"(local utils (require "my.mod"))"#);
+        assert_eq!(r.module_bindings.get("utils").map(|s| s.as_str()), Some("my.mod"));
+    }
+
+    #[test]
+    fn module_binding_var_keyword() {
+        let r = analyze_src("(var lib (require :lib))");
+        assert_eq!(r.module_bindings.get("lib").map(|s| s.as_str()), Some("lib"));
+    }
+
+    #[test]
+    fn non_require_binding_not_recorded() {
+        let r = analyze_src("(local x 42)");
+        assert!(r.module_bindings.is_empty());
+    }
+
+    #[test]
+    fn destructured_binding_not_recorded_as_module() {
+        let r = analyze_src("(local {:foo foo} (require :mod))");
+        // Destructuring: forms[1] is a Table, not a Symbol — no module_bindings entry
+        assert!(r.module_bindings.is_empty());
+    }
+
+    // ── Unused require warnings ───────────────────────────────────────────────
+
+    #[test]
+    fn unused_require_warns() {
+        assert!(has_warning(
+            "(local api (require :my-mod))",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn used_require_no_warn() {
+        assert!(!has_warning(
+            "(local api (require :my-mod)) (api.call)",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn used_require_field_access_no_warn() {
+        // api.foo is a reference to the root `api` binding
+        assert!(!has_warning(
+            "(local api (require :mod)) api.foo",
+            "required but never used",
+        ));
+    }
+
+    #[test]
+    fn unused_require_not_double_warned_as_unused_local() {
+        // Unused require should emit the require message, NOT "defined but never used"
+        let ws = warnings_for("(local api (require :mod))");
+        assert!(ws.iter().any(|w| w.contains("required but never used")));
+        assert!(!ws.iter().any(|w| w.contains("defined but never used")));
+    }
+
+    // ── Table field completions ───────────────────────────────────────────────
+
+    #[test]
+    fn table_fields_extracted_from_literal() {
+        let r = analyze_src("(local t {:a 1 :b 2})");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"a".to_string()), "expected 'a' in fields: {:?}", fields);
+        assert!(fields.contains(&"b".to_string()), "expected 'b' in fields: {:?}", fields);
+    }
+
+    #[test]
+    fn table_fields_string_keys() {
+        let r = analyze_src(r#"(local t {"name" 1 "age" 2})"#);
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"name".to_string()));
+        assert!(fields.contains(&"age".to_string()));
+    }
+
+    #[test]
+    fn table_fields_non_table_rhs_is_none() {
+        let r = analyze_src("(local x 42)");
+        let def = r.defs.values().find(|d| d.name == "x").unwrap();
+        assert!(def.table_fields.is_none());
+    }
+
+    #[test]
+    fn table_fields_let_binding() {
+        let r = analyze_src("(let [t {:x 10 :y 20}] t)");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"x".to_string()));
+        assert!(fields.contains(&"y".to_string()));
+    }
+
+    #[test]
+    fn table_fields_computed_key_skipped_others_kept() {
+        // Computed keys (non-keyword, non-string) are silently skipped; static ones are kept.
+        let r = analyze_src("(local t {:a 1})");
+        let def = r.defs.values().find(|d| d.name == "t").unwrap();
+        let fields = def.table_fields.as_deref().unwrap_or(&[]);
+        assert!(fields.contains(&"a".to_string()));
     }
 }

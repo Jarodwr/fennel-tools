@@ -65,7 +65,16 @@ function flatten_extensions(extensions) {
 		(acc, extension) => _.mergeWith(
 			acc,
 			extension,
-			(base, extension) => Array.isArray(base) ? [...base, extension] : undefined,
+			// A nested flatten_extensions call (e.g. builtin-forms.js
+			// re-exporting the already-flattened contents of its own
+			// extensions/builtin-forms/ subdirectory) hands us an `inline`/
+			// `conflicts` that is itself already an array. Spread those in
+			// rather than pushing the whole array as one element, or every
+			// entry from a nested extension silently vanishes at the
+			// stray-array filter below.
+			(base, extension) => Array.isArray(base)
+				? (Array.isArray(extension) ? [...base, ...extension] : [...base, extension])
+				: undefined,
 		),
 		{ rules: {}, forms: {}, inline: [], conflicts: [] },
 	);

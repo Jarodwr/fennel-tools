@@ -1,0 +1,7 @@
+[tools]
+rust = "latest"
+node = "latest"
+tree-sitter = "latest"
+
+[hooks]
+enter = "echo 'fennel-ls-rs dev shell (mise)'; echo '  cargo build / cargo test   — LSP crate'; echo '  cd tree-sitter-fennel'; echo '  npm install && tree-sitter generate   — regenerate parser.c after grammar changes'"

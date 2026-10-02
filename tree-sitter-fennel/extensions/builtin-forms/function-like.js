@@ -1,46 +1,49 @@
 const {
 	item,
-	kv_pair,
 	form,
 	sequence,
-	table,
-	string,
 } = require('../../grammar-lib/dsl.js');
-const {
-	PREC_LAST_RESORT,
-} = require('../../grammar-lib/prec.js');
 
 const rules = {};
 const forms = {};
 
 rules['_function_identifier'] = $ => choice(
 	$.symbol,
+	$._symbol_with_trailing_dot,
 	$.multi_symbol,
+	$.multi_symbol_method,
 );
 
+// The reader doesn't enforce "& must be last" — that's a compiler-level
+// check (see test/failures.fnl's "expected rest argument before last
+// parameter", only reachable if this parses in the first place). So rest
+// markers/varargs are allowed interspersed with ordinary parameters,
+// deferring validity to the compiler like everywhere else in this file.
 rules['sequence_arguments'] = $ => sequence(
-	repeat(item($._binding)),
-	optional(choice(
+	repeat(choice(
+		item($._binding),
 		item($.rest_binding),
 		item(alias('...', $.symbol_binding)),
 	)),
 );
 
-rules['_table_metadata_key_docstring'] = $ => string($, 'fnl/docstring');
-rules['_table_metadata_docstring'] = $ => kv_pair($, { key: alias($._table_metadata_key_docstring, $.string) }, { value: alias($.string, $.docstring) });
-rules['_table_metadata_key_arglist'] = $ => string($, 'fnl/arglist');
-rules['_table_metadata_arglist'] = $ => kv_pair($, { key: alias($._table_metadata_key_arglist, $.string) }, { value: $.sequence_arguments });
-rules['_table_metadata_generic'] = $ => prec.right(PREC_LAST_RESORT + 1, kv_pair($, { key: $.string }));
-rules['table_metadata_pair'] = $ => choice(
-	$._table_metadata_docstring,
-	$._table_metadata_arglist,
-	$._table_metadata_generic,
-);
-
-rules['table_metadata'] = $ => table(repeat(item($.table_metadata_pair)));
+// Structurally identical to a plain `table`: a separately-defined
+// table_metadata rule (with its own docstring/arglist/generic pair
+// sub-rules) can't be reliably disambiguated from a plain `table` used as
+// the function's actual return value without unbounded lookahead — the
+// parser commits to the metadata-shaped path as soon as it sees the first
+// pair and has no way back if nothing metadata-relevant turns out to
+// follow (e.g. `(fn f [] {:a 1})` with the table as the sole return
+// value). Reusing `table`'s own rule via alias means there's exactly one
+// parse path for `{...}`, and "is this metadata or the return value"
+// becomes an ordinary choice resolved only *after* the table is fully
+// parsed. The cost: metadata pairs surface as plain `table_pair` nodes,
+// not typed docstring/arglist fields — tooling that wants metadata
+// semantics should inspect a pair's string key content
+// (":fnl/docstring", ":fnl/arglist") directly instead.
 rules['_function_inner_body_all'] = $ => seq(
 	field('docstring', alias($.string, $.docstring)),
-	field('metadata', $.table_metadata),
+	field('metadata', alias($.table, $.table_metadata)),
 	repeat1(item($._sexp)),
 );
 rules['_function_inner_body_docstring'] = $ => seq(
@@ -48,7 +51,7 @@ rules['_function_inner_body_docstring'] = $ => seq(
 	repeat1(item($._sexp)),
 );
 rules['_function_inner_body_metadata'] = $ => seq(
-	field('metadata', $.table_metadata),
+	field('metadata', alias($.table, $.table_metadata)),
 	repeat1(item($._sexp)),
 );
 rules['_function_inner_body_generic'] = $ => prec(1, repeat1(item($._sexp)));
@@ -84,4 +87,14 @@ forms['hashfn'] = $ => form($,
 module.exports = {
 	rules,
 	forms,
+
+	// The metadata field now reuses table's own rule (see comment above),
+	// so a trailing `{...}` is genuinely ambiguous between "this is the
+	// metadata field" and "this is just the next body sexp" until the
+	// parser sees what (if anything) follows it. Let GLR try both and keep
+	// whichever completes.
+	conflicts: $ => [
+		[$._sexp, $._function_inner_body_metadata],
+		[$._sexp, $._function_inner_body_all],
+	],
 };

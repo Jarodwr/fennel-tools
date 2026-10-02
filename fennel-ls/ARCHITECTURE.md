@@ -62,7 +62,7 @@ analysis yet.
 | **Find references** | Returns all use-sites of the definition the cursor is on (or the definition a reference points to). Includes the definition itself. |
 | **Document highlight** | Same logic as find-references but returns `WRITE` kind for the definition and `READ` for uses. |
 | **Document symbols** | Lists every definition in the file (all `DefKind` variants). |
-| **Completion** | Returns scope-local definitions (respecting lexical scope at the cursor position) followed by all built-ins. Deduplicates by name. Sorted alphabetically. |
+| **Completion** | Returns scope-local definitions (respecting lexical scope at the cursor position) followed by all built-ins and any custom `global_docs` entries. Deduplicates by name. Sorted alphabetically. |
 | **Rename** | Renames all occurrences of a definition within the current file. |
 | **Code actions** | `var → local` quickfix on any `var` that was never mutated. Unknown-identifier quickfix that inserts `(local name nil)` above the offending line. |
 | **Semantic tokens** | Full-document classification (`function`, `parameter`, `variable`, `macro`). Modifiers: `definition`, `readonly`. Delta-encoded from the sorted `syms` vec. |
@@ -73,10 +73,103 @@ Text sync mode: **INCREMENTAL** — the client sends only changed ranges; each
 `TextDocumentContentChangeEvent` is applied in sequence to the in-memory text,
 then the pipeline re-runs on the full (now-updated) text.
 
-**Configuration:** on `initialize`, the server reads `.fennel-ls.toml` from
-the workspace root (if present). Supported fields: `platform` (selects the
-active `BuiltinSet`) and `known_globals` (suppresses unknown-identifier
-warnings for named globals).
+**Configuration:** on `initialize`, the server evaluates `.lsp.fnl` from
+the workspace root (if present). See the **Configuration** section below.
+
+---
+
+## Configuration
+
+The server looks for `.lsp.fnl` in the workspace root on startup and evaluates
+it as a Fennel file using the bundled Fennel runtime.  The file must return a
+table; a missing file or an empty table `{}` both produce default behaviour.
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `:platform` | string | Lua platform for built-in docs: `"lua51"`, `"lua52"`, `"lua53"`, `"lua54"` (default), `"luajit"`, `"luau"`. |
+| `:known-globals` | string array | Global names that suppress unknown-identifier warnings but have no hover documentation. Roots derived from `:global-docs` keys are added automatically, so only list globals with no associated docs here (e.g. engine-injected tables like `state`). |
+| `:global-docs` | table | Per-symbol hover documentation. See below. |
+
+Both kebab-case (`:known-globals`, `:global-docs`) and snake_case
+(`:known_globals`, `:global_docs`) keys are accepted.
+
+### `:global-docs`
+
+Each key is the exact Fennel symbol as it appears in source code, including
+dots for namespaced APIs.  Each value is a table with two fields:
+
+| Field | Required | Description |
+|---|---|---|
+| `:signature` | yes | Short Fennel-style call form shown in the hover code block. |
+| `:doc` | no | Prose description shown below the signature. Supports Markdown. |
+
+**Root inference:** the server automatically extracts the root of every
+`:global-docs` key (everything before the first `.` or `:`) and adds it to the
+known-globals set.  You do not need to list `Mosaic` in `:known-globals` just
+because you have a `"Mosaic.Grid.set_tile"` entry.
+
+**Hover fallback:** on hover the server tries the full symbol name first
+(e.g. `Mosaic.Grid.set_tile`), then strips the last member and retries
+(`Mosaic.Grid`), then strips again (`Mosaic`), until it finds a match or
+exhausts the chain.  A single entry for a namespace therefore acts as a
+fallback doc for any undocumented member of that namespace.
+
+### Minimal example
+
+```fennel
+;; .lsp.fnl
+{:platform "luajit"
+ :known-globals ["state"]}   ; persistent game-state table, no docs needed
+```
+
+### Inline global docs
+
+```fennel
+;; .lsp.fnl
+{:platform "luajit"
+ :known-globals ["state"]
+ :global-docs
+ {"Mosaic.Grid.set_tile"
+  {:signature "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
+   :doc "Draw a tile on the grid.\n- `primary` / `secondary` — `{r g b a}` colour tables (values 0–1).\n- `rotation` — radians clockwise around the tile centre (default `0`)."}
+
+  "Mosaic.Input.cursor_cell"
+  {:signature "(Mosaic.Input.cursor_cell)"
+   :doc "Returns `{col row}` of the cell under the cursor, or `nil` if outside the grid."}}}
+```
+
+### Splitting docs into a shared file
+
+Because `.lsp.fnl` is evaluated Fennel, you can `require` other `.fnl` files
+and merge their tables.  This is the idiomatic way to keep engine API docs
+alongside the engine source and reference them from per-project configs.
+
+**`engine/mosaic-api.fnl`** (returns the `:global-docs` table directly):
+```fennel
+{"Mosaic.Grid.set_tile"
+ {:signature "(Mosaic.Grid.set_tile col row index primary secondary rotation)"
+  :doc "Draw a tile on the grid."}
+
+ "Mosaic.Input.cursor_cell"
+ {:signature "(Mosaic.Input.cursor_cell)"
+  :doc "Returns `{col row}` of the cell under the cursor."}}
+```
+
+**`my-game/.lsp.fnl`**:
+```fennel
+(local mosaic (require :mosaic-api))   ; resolved via fennel.path from workspace root
+
+{:platform "luajit"
+ :known-globals ["state"]
+ :global-docs mosaic}
+```
+
+`require` resolves `.fnl` files relative to the workspace root using Fennel's
+standard `?.fnl` and `?/init.fnl` search patterns, so the module path above
+matches `<workspace-root>/mosaic-api.fnl`.  For files outside the workspace
+root you can use `dofile` with an absolute path instead.
 
 ---
 
@@ -479,8 +572,7 @@ and emits indented text:
 
 Wire the formatter into `textDocument/formatting` and
 `textDocument/rangeFormatting`. Configuration options (indent width, column
-limit) can be passed via `FormattingOptions` or a `.fennel-ls.toml` file in
-the workspace root.
+limit) can be passed via `FormattingOptions` or `.lsp.fnl` in the workspace root.
 
 ---
 
@@ -622,7 +714,7 @@ src/server.rs   — 44 unit tests (format_definition, def_kind_to_symbol_kind,
 
 src/text.rs     — 15 unit tests
 
-src/config.rs   — 5 unit tests (TOML parsing, defaults, error handling)
+src/config.rs   — 8 unit tests (.lsp.fnl parsing, require integration, defaults, error handling)
 
 tree-sitter-fennel/test/corpus/
   edge-cases.txt  — comma-as-separator, unquote_splice in sequence, multiple

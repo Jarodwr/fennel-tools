@@ -1,43 +1,62 @@
-const _ = require('lodash');
+// A deliberately "dumb" sibling of ../grammar.js: every s-expression is
+// just a list/sequence/table/atom, with no special-form specialization
+// (no fn_form, no symbol_binding, no sequence_arguments — everything that
+// isn't a reader macro or a literal is a plain `symbol`, `list`,
+// `sequence`, or `table`). It shares the real grammar's lexer/scanner
+// infrastructure (comments, strings, numbers, reader macros, multi-symbols
+// — all the real-world edge cases already hardened in the main grammar),
+// just without the constrained sub-rules that reserve specific shapes for
+// `fn`/`let`/`case`/etc.'s arguments.
+//
+// This exists because those reserved shapes are exactly what makes the
+// main grammar fragile mid-edit: typing a plain symbol into what the main
+// grammar calls a binding position (e.g. `fn`'s parameter list) can
+// legitimately fail to match that position's specific sub-grammar and
+// surface as a real tree-sitter ERROR node, even though the text is
+// perfectly parseable as generic Fennel. A structural editor (paredit)
+// doesn't need to know a form is a binding position to navigate it — it
+// just needs a tree that can never fail to parse balanced brackets and
+// atoms, which is exactly what this variant guarantees: with no reserved
+// shapes, there's nothing content can fail to fit.
+//
+// Never linked into the Rust crate or any language binding — this is
+// wasm-only, loaded directly by fennel-editor's paredit engine. See
+// generic/README.md for the build command.
 const {
 	kv_pair,
-	item,
 	call,
+	item,
 	colon_string,
 	double_quote_string,
 	list,
 	sequence,
 	table,
-} = require('./grammar-lib/dsl.js');
-const {
-	require_dir,
-	flatten_extensions,
-} = require('./grammar-lib/fs.js');
+} = require('../grammar-lib/dsl.js');
 const {
 	PREC_LAST_RESORT,
 	PREC_IMPORTANT,
-} = require('./grammar-lib/prec.js');
+} = require('../grammar-lib/prec.js');
 const {
 	READER_MACROS,
 	SPECIAL_STANDALONE_SYMBOLS,
-} = require('./grammar-lib/constants.js');
+} = require('../grammar-lib/constants.js');
 const {
 	reader_macro_nodes,
 	reader_macro_group,
-} = require('./grammar-lib/node-utils.js').nodify_reader_macros();
-
-const extensions = flatten_extensions(require_dir('extensions'));
+} = require('../grammar-lib/node-utils.js').nodify_reader_macros();
 
 module.exports = grammar({
+	// distinct: the external scanner's exported C function names
+	// (tree_sitter_fennel_external_scanner_*) are derived from this field,
+	// and this variant reuses that same scanner.c unmodified. The two
+	// grammars are never linked into the same binary (this one is
+	// wasm-only, loaded directly by web-tree-sitter under a distinct
+	// filename), so the shared name causes no collision at runtime.
 	name: 'fennel',
 
 	extras: $ => [
 		/\s/,
 		$.comment,
-		// Fennel treats commas as whitespace separators. The external scanner
-		// takes priority and converts ,expr → unquote and ,@expr → unquote_splice
-		// before the internal lexer ever sees a comma, so adding ',' here only
-		// skips commas that the scanner has already rejected (i.e. bare separators).
 		',',
 	],
 
@@ -53,18 +72,6 @@ module.exports = grammar({
 		$.__token_count,
 	],
 
-	inline: $ => [
-		..._.flatMap(extensions.inline, inline => inline($)),
-	],
-
-	conflicts: $ => [
-		..._.flatMap(extensions.conflicts, conflicts => conflicts($)),
-		// See the comment on _symbol_with_trailing_dot: whether a trailing
-		// `.` joins the preceding symbol or starts a separate standalone
-		// `.` item is only decidable by what (if anything) can follow, so
-		// force GLR to try both instead of picking one at generation time.
-	],
-
 	word: $ => $.symbol,
 
 	rules: {
@@ -78,6 +85,7 @@ module.exports = grammar({
 			field('body', alias(/.*/, $.comment_body)),
 		)),
 
+		// No $._form here — that's the entire difference from ../grammar.js.
 		_sexp: $ => choice(
 			$._reader_macro,
 			$._special_override_symbol,
@@ -85,7 +93,6 @@ module.exports = grammar({
 			$.symbol,
 			$.multi_symbol,
 			$.multi_symbol_method,
-			$._form,
 			$.list,
 			$.sequence,
 			$.table,
@@ -102,34 +109,12 @@ module.exports = grammar({
 
 		list: $ => list(optional($._list_content)),
 
-		...extensions.rules,
-		...extensions.forms,
-
-		_form: $ => choice(...[...Object.keys(extensions.forms)].map(form => $[form])),
-
 		sequence: $ => sequence(repeat(item($._sexp))),
 
-		// value additionally allows a trailing-dot symbol (see
-		// _symbol_with_trailing_dot) for shorthand pairs like
-		// `{: test-?.}`. Scoped narrowly to this one field rather than
-		// added to _sexp generally, since _sexp's `program`-level
-		// repetition already has a perfectly good (and preferred)
-		// alternative reading — a standalone `.` item followed by
-		// whatever comes next — that a global addition would incorrectly
-		// override.
 		table_pair: $ => kv_pair($, {}, { value: choice($._sexp, $._symbol_with_trailing_dot) }),
 
 		table: $ => prec(PREC_LAST_RESORT, table(repeat(item($.table_pair)))),
 
-		// A quoted/quasiquoted form is a literal template, not code to be
-		// executed yet — `(let ,bindings ,body) is just a 3-element list,
-		// not something that must already look like a well-formed `let`.
-		// So inside quote/quasiquote, lists never try to parse as special
-		// forms (_form); only a nested unquote/unquote-splice re-enters
-		// normal `_sexp` parsing (since that's a real expression to
-		// evaluate, not template material). The quoted list/sequence/table
-		// rules below are aliased back onto the public `list`/`sequence`/
-		// `table` node types so the tree shape stays uniform either way.
 		_quoted_sexp: $ => choice(
 			$._reader_macro,
 			$._special_override_symbol,
@@ -154,9 +139,6 @@ module.exports = grammar({
 		_quoted_table_pair: $ => kv_pair($, { key: $._quoted_sexp }, { value: $._quoted_sexp }),
 		_quoted_table: $ => prec(PREC_LAST_RESORT, table(repeat(item($._quoted_table_pair)))),
 
-		// NOTE: Last resort precedence here is nice to have for when forms define
-		// literal-specific syntax (mostly strings), like with metadata `:fnl/docstring`
-		// in a function form.
 		_literal: $ => prec.right(PREC_LAST_RESORT, choice(
 			$.string,
 			$.number,
@@ -169,16 +151,6 @@ module.exports = grammar({
 
 		_colon_string: $ => colon_string($, choice(
 			...[
-				// HACK(alexmozaidze): Fixes expressions such as:
-				// `:?.`
-				// `:true`
-				// `:nil`
-				// `:$...`
-				//
-				// and so on, being parsed as 2 separate tokens.
-				//
-				// Dynamic precedence could probably eliminate this HACK, but
-				// I would prefer to stray away from it.
 				...SPECIAL_STANDALONE_SYMBOLS,
 				'nil',
 				'true',
@@ -210,7 +182,6 @@ module.exports = grammar({
 			),
 		)),
 
-		// TODO: Separate floats from integers.
 		number: $ => {
 			const sign = choice('-', '+');
 			const digits = /\d[_\d]*/;
@@ -245,8 +216,6 @@ module.exports = grammar({
 				special,
 			);
 
-			// HACK: Mark number rule precedence as important,
-			// because special_literal is misparsed as multi_symbol
 			return prec(PREC_IMPORTANT, token(choice(
 				decimal_literal,
 				hexadecimal_literal,
@@ -274,26 +243,8 @@ module.exports = grammar({
 		symbol_option: $ => /&[^(){}\[\]"'~;,@`.:\s]*/,
 		symbol: $ => /[^#(){}\[\]"'~;,@`.:\s][^(){}\[\]"'~;,@`.:\s]*/,
 
-		// A `.` after a symbol normally starts a multi_symbol fragment, so
-		// plain `symbol` stops before it. But per upstream Fennel's own
-		// multi-sym? (utils.fnl), a symbol ending in a bare `.` with
-		// nothing after it — like `test-?.` — isn't a multi-symbol at all;
-		// there's no fragment for that dot to introduce, so it should just
-		// be part of the symbol. tree-sitter's token regexes can't express
-		// "only if nothing valid follows" (no lookaround support), so this
-		// is deliberately only wired into specific required-single-symbol
-		// fields (_function_identifier, table_pair's value) rather than
-		// into _sexp generally: at the `_sexp`/`program` level there's
-		// already a perfectly good fallback reading — a standalone `.`
-		// item (from SPECIAL_STANDALONE_SYMBOLS) followed by whatever's
-		// next — and shift/reduce resolution there prefers extending this
-		// rule over taking that reading, which is wrong when something
-		// meaningful (not just end-of-input) follows the dot, as in
-		// `ha.#haha`.
 		_symbol_with_trailing_dot: $ => alias(seq($.symbol, token.immediate('.')), $.symbol),
 
-		// NOTE: multi-symbol fragments starting from second position onwards have fewer restrictions on what
-		// symbols they may contain, which is why its regex is just a stripped down version of $.symbol.
 		_multi_symbol_fragment: $ => alias(token.immediate(/[^(){}\[\]"'~;,@`.:\s]+/), $.symbol_fragment),
 
 		_special_override_symbol: $ => alias(
@@ -301,12 +252,6 @@ module.exports = grammar({
 			$.symbol
 		),
 
-		// Overrides the generic reader_macro_nodes entries (spread in above)
-		// for quote/quasiquote specifically: their contents are templates,
-		// so they recurse through `_quoted_sexp` rather than `_sexp`. See
-		// the comment on `_quoted_sexp` for why. unquote/unquote_splice/
-		// hashfn keep the generic definition (still `_sexp`), since they
-		// always introduce a real expression, quoted context or not.
 		quote_reader_macro: $ => prec(-1, seq(
 			field('macro', alias($._quote_reader_macro_char, '\'')),
 			field('expression', $._quoted_sexp),
