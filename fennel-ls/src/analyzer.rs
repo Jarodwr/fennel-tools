@@ -212,6 +212,14 @@ struct Analyzer {
     /// Hook results from a previous hook-runner pass, keyed by call_span_start.
     /// When populated, the catch-all macro branch uses these instead of in_macro tagging.
     hook_results: HashMap<u32, Vec<crate::hooks::Instruction>>,
+    /// Span starts of nodes a hook asked to leave unanalyzed (`:skip`).
+    skipped: std::collections::HashSet<u32>,
+    /// Def-bytes of implicit parameters (a hook's `:implicit-params`): never
+    /// reported as unused.
+    implicit_defs: std::collections::HashSet<u32>,
+    /// Next synthetic def-byte for an implicit parameter, which has no source
+    /// text of its own. Counts down from below the global macros' range.
+    next_implicit_byte: u32,
 }
 
 impl Analyzer {
@@ -222,6 +230,9 @@ impl Analyzer {
             mutation_targets: std::collections::HashSet::new(),
             macro_depth: 0,
             hook_results: HashMap::new(),
+            skipped: std::collections::HashSet::new(),
+            implicit_defs: std::collections::HashSet::new(),
+            next_implicit_byte: u32::MAX - (1 << 20),
         }
     }
 
@@ -290,6 +301,33 @@ impl Analyzer {
         byte
     }
 
+    /// Bind `name` in the current scope as a parameter that isn't written in
+    /// the source (a hook's implicit parameter, such as a method's `self`).
+    /// Its definition points at `anchor`; it has no symbol entry of its own.
+    fn define_implicit(&mut self, name: &str, anchor: &Span) -> u32 {
+        let byte = self.next_implicit_byte;
+        self.next_implicit_byte -= 1;
+        self.result.defs.insert(
+            byte,
+            DefinitionInfo {
+                name: name.to_string(),
+                kind: DefKind::Param,
+                span: anchor.clone(),
+                params: None,
+                doc: None,
+                variadic: false,
+                returns_multiple: false,
+                table_fields: None,
+                source_module: None,
+            },
+        );
+        self.implicit_defs.insert(byte);
+        if let Some(scope_idx) = self.current_scope() {
+            self.result.scopes[scope_idx].bindings.insert(name.to_string(), byte);
+        }
+        byte
+    }
+
     /// Record a symbol reference; looks up the scope chain for its definition.
     fn reference(&mut self, name: &str, span: &Span) {
         // For multisyms like `a.b.c` or `a:method`, look up the root part.
@@ -333,6 +371,9 @@ impl Analyzer {
     }
 
     fn analyze(&mut self, node: &AstNode) {
+        if !self.skipped.is_empty() && self.skipped.contains(&node.span.start) {
+            return;
+        }
         match &node.node {
             Form::Symbol(name) => self.reference(name, &node.span),
 
@@ -473,17 +514,20 @@ impl Analyzer {
                 Instruction::Bind { name, span } => {
                     self.define(name, span, DefKind::Local, None, None);
                 }
-                Instruction::Analyze { index } => {
-                    if let Some(form) = forms.get(index - 1) {
+                Instruction::Analyze { path } => {
+                    if let Some(form) = node_at_path(forms, path) {
                         self.analyze(form);
                     }
                 }
-                Instruction::AnalyzeFn { index } => {
-                    if let Some(form) = forms.get(index - 1) {
+                Instruction::AnalyzeFn { path, implicit_params } => {
+                    if let Some(form) = node_at_path(forms, path) {
                         if let Form::List(sub_forms) = &form.node {
-                            self.analyze_fn(sub_forms, &form.span);
+                            self.analyze_fn_with(sub_forms, &form.span, implicit_params);
                         }
                     }
+                }
+                Instruction::Skip { span } => {
+                    self.skipped.insert(span.start);
                 }
                 Instruction::ScopeOpen { span } => {
                     self.push_scope(span.clone());
@@ -669,6 +713,11 @@ impl Analyzer {
     // ── (fn name? [params] body...) ───────────────────────────────────────────
 
     fn analyze_fn(&mut self, forms: &[AstNode], list_span: &Span) {
+        self.analyze_fn_with(forms, list_span, &[]);
+    }
+
+    /// `analyze_fn`, also binding `implicit_params` in the function's scope
+    fn analyze_fn_with(&mut self, forms: &[AstNode], list_span: &Span, implicit_params: &[String]) {
         if forms.len() < 2 {
             return;
         }
@@ -709,6 +758,9 @@ impl Analyzer {
 
         let fn_scope_span = list_span.clone();
         self.push_scope(fn_scope_span);
+        for name in implicit_params {
+            self.define_implicit(name, &forms[0].span);
+        }
 
         let mut param_names = Vec::new();
         let mut variadic = false;
@@ -1487,6 +1539,21 @@ fn tail_may_return_multiple(node: &AstNode) -> bool {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// The node at a hook's 1-based `path` into a macro call's children
+/// (`forms`, the head included): `[5 3]` is forms[4]'s third child.
+fn node_at_path<'a>(forms: &'a [AstNode], path: &[usize]) -> Option<&'a AstNode> {
+    let (first, rest) = path.split_first()?;
+    let mut node = forms.get(first.checked_sub(1)?)?;
+    for &i in rest {
+        let children = match &node.node {
+            Form::List(ch) | Form::Sequence(ch) | Form::Table(ch) => ch,
+            _ => return None,
+        };
+        node = children.get(i.checked_sub(1)?)?;
+    }
+    Some(node)
+}
+
 pub fn analyze(ast: &[AstNode]) -> AnalysisResult {
     analyze_with_hooks(ast, &HashMap::new(), &HashMap::new())
 }
@@ -1585,6 +1652,7 @@ pub fn analyze_with_hooks(
         .filter(|(&db, def)| {
             def.kind == DefKind::Param
                 && !referenced.contains(&db)
+                && !analyzer.implicit_defs.contains(&db)
                 && !def.name.starts_with('_')
                 && !def.name.starts_with('<')
                 && !def.name.starts_with('$')
@@ -2659,7 +2727,7 @@ mod tests {
         // The (fn greet ...) form is at index 2 of the defnode call (1-based: index 3).
         // In forms[], that's forms[2] (0-based). AnalyzeFn { index: 3 } → forms[2].
         let hook_results = make_hook_results(call_span, vec![
-            crate::hooks::Instruction::AnalyzeFn { index: 3 },
+            crate::hooks::Instruction::AnalyzeFn { path: vec![3], implicit_params: vec![] },
         ]);
         let second_pass = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
 
@@ -2669,6 +2737,85 @@ mod tests {
         assert!(has_def(&second_pass, "x"), "x param should be a def");
         // x in the body should resolve to the param
         assert!(!is_unknown(&second_pass, "x"), "x in body should resolve");
+    }
+
+    /// The defnode call's span start in a first pass over `src`
+    fn defnode_call(ast: &[AstNode]) -> u32 {
+        analyze(ast).macro_calls.iter()
+            .find(|(_, _, n)| n == "defnode")
+            .map(|(s, _, _)| *s)
+            .expect("defnode call")
+    }
+
+    fn has_warning_about(r: &AnalysisResult, text: &str) -> bool {
+        r.warnings.iter().any(|w| w.message.contains(text))
+    }
+
+    #[test]
+    fn hook_path_reaches_nested_nodes() {
+        // (group G (prop p default)): the default is three levels down
+        let src = "(import-macros {: defnode} :mylib) (local Enemy 1) \
+                   (defnode Foo (group G (prop p Enemy)) (prop q missing))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let call = defnode_call(&ast);
+        let hook_results = make_hook_results(call, vec![
+            crate::hooks::Instruction::Analyze { path: vec![3, 3, 3] },
+            crate::hooks::Instruction::Analyze { path: vec![4, 3] },
+            crate::hooks::Instruction::Analyze { path: vec![9, 9] },  // out of range: ignored
+        ]);
+        let r = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+        assert!(ref_resolves(&r, "Enemy"), "a nested default resolves");
+        assert!(!has_warning_about(&r, "`Enemy` is defined but never used"));
+        assert!(is_unknown(&r, "missing"), "a path of length two still checks");
+        assert!(!r.syms.iter().any(|s| s.name == "group" || s.name == "prop"), "DSL heads aren't analyzed");
+    }
+
+    #[test]
+    fn hook_implicit_params_bind_without_unused_warnings() {
+        let src = "(import-macros {: defnode} :mylib) \
+                   (defnode Foo (method uses [x] (+ self.n x)) (method ignores [] 1))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let call = defnode_call(&ast);
+        let hook_results = make_hook_results(call, vec![
+            crate::hooks::Instruction::AnalyzeFn { path: vec![3], implicit_params: vec!["self".into()] },
+            crate::hooks::Instruction::AnalyzeFn { path: vec![4], implicit_params: vec!["self".into()] },
+        ]);
+        let r = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+        assert!(ref_resolves(&r, "self.n"), "self resolves to the implicit parameter");
+        assert!(!is_unknown(&r, "self.n"));
+        assert!(ref_resolves(&r, "x"), "written parameters still bind");
+        assert!(!has_warning_about(&r, "parameter `self` is unused"), "an implicit parameter never warns");
+        assert_eq!(def_kind(&r, "uses"), Some(DefKind::Fn), "the head isn't checked: method works as fn");
+    }
+
+    #[test]
+    fn hook_skip_leaves_a_node_unanalyzed() {
+        let src = "(import-macros {: defnode} :mylib) \
+                   (defnode Foo (method take [d] (super take d)))";
+        let (ast, _) = crate::parser::Parser::parse(src);
+        let call = defnode_call(&ast);
+        // The spans of `super` and `take` inside (super take d)
+        let method = crate::workspace::find_list_at(&ast, call).and_then(|n| match &n.node {
+            Form::List(ch) => ch.get(2),
+            _ => None,
+        }).expect("method form");
+        let super_call = match &method.node {
+            Form::List(ch) => ch.last().expect("body"),
+            _ => panic!("method is a list"),
+        };
+        let (head, name) = match &super_call.node {
+            Form::List(ch) => (ch[0].span.clone(), ch[1].span.clone()),
+            _ => panic!("super call is a list"),
+        };
+        let hook_results = make_hook_results(call, vec![
+            crate::hooks::Instruction::Skip { span: head },
+            crate::hooks::Instruction::Skip { span: name },
+            crate::hooks::Instruction::AnalyzeFn { path: vec![3], implicit_params: vec!["self".into()] },
+        ]);
+        let r = analyze_with_hooks(&ast, &hook_results, &HashMap::new());
+        assert!(!is_unknown(&r, "super"), "a skipped head isn't reported");
+        assert!(!r.syms.iter().any(|s| s.name == "take" && !s.is_def), "a skipped name isn't a reference");
+        assert!(ref_resolves(&r, "d"), "the rest of the call is analyzed");
     }
 
     #[test]
