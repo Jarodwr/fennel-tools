@@ -685,10 +685,13 @@ impl Analyzer {
         }
         if let Form::Symbol(name) = &forms[1].node {
             let root = name.split(['.', ':']).find(|s| !s.is_empty()).unwrap_or(name);
+            // `(set x.field v)` changes the table in x, not x: only a plain
+            // `(set x v)` rebinds a local (a var counts as mutated either way)
+            let rebinds = root == name.as_str();
             if let Some(def_byte) = self.lookup(root) {
                 if let Some(def) = self.result.defs.get(&def_byte) {
                     match def.kind {
-                        DefKind::Local | DefKind::Fn => {
+                        DefKind::Local | DefKind::Fn if rebinds => {
                             self.result.warnings.push(AnalysisWarning {
                                 message: format!(
                                     "`{}` is immutable; use `var` instead of `local` to allow mutation",
@@ -3207,6 +3210,13 @@ mod tests {
     }
 
     // ── Unused local warnings ─────────────────────────────────────────────────
+
+    #[test]
+    fn setting_a_field_of_a_local_is_not_rebinding_it() {
+        assert!(!has_warning("(local t {}) (set t.x 1) t", "is immutable"));
+        assert!(!has_warning("(local t {:a {}}) (set t.a.b 1) t", "is immutable"));
+        assert!(has_warning("(local t {}) (set t 1) t", "is immutable"), "a plain set still warns");
+    }
 
     #[test]
     fn unused_local_warns() {
