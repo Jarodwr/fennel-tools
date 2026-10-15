@@ -322,7 +322,7 @@ impl LanguageServer for Backend {
             self.apply_config(&path);
             let _ = self.workspace_root.set(path);
         } else {
-            log::warn!("initialize: no workspace root could be resolved — config will not be loaded");
+            log::warn!("initialize: no workspace root from the client; the first opened file's nearest .lsp.fnl will set it");
         }
 
         Ok(InitializeResult {
@@ -494,6 +494,18 @@ impl LanguageServer for Backend {
     // ── Text synchronization ──────────────────────────────────────────────────
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        // A client may give no root (Helix, in a directory without a root
+        // marker such as .git): take the first opened file's nearest
+        // directory with a .lsp.fnl, as `fennel-ls check` does
+        if self.workspace_root.get().is_none() {
+            if let Some(root) = params.text_document.uri.to_file_path().ok()
+                .and_then(|path| config_root(&path))
+            {
+                log::info!("did_open: workspace root from .lsp.fnl → {}", root.display());
+                self.apply_config(&root);
+                let _ = self.workspace_root.set(root);
+            }
+        }
         let doc = params.text_document;
         let text = doc.text.clone();
         let uri = doc.uri.clone();
@@ -2009,6 +2021,14 @@ impl LanguageServer for Backend {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Map a platform string from config to the Platform enum.
+/// The nearest directory at or above `file`'s that holds a `.lsp.fnl`
+pub(crate) fn config_root(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    file.parent()?
+        .ancestors()
+        .find(|dir| dir.join(".lsp.fnl").is_file())
+        .map(|dir| dir.to_path_buf())
+}
+
 pub(crate) fn platform_from_str(s: &str) -> Option<Platform> {
     match s {
         "lua51" => Some(Platform::Lua51),
@@ -3564,6 +3584,18 @@ mod tests {
     }
 
     // ── platform_from_str ─────────────────────────────────────────────────────
+
+    #[test]
+    fn config_root_is_the_nearest_lsp_fnl() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("scenes/enemies")).unwrap();
+        std::fs::write(project.join(".lsp.fnl"), "{}").unwrap();
+        let file = project.join("scenes/enemies/boss.fnl");
+        assert_eq!(config_root(&file), Some(project.clone()));
+        assert_eq!(config_root(&project.join("main.fnl")), Some(project));
+        assert_eq!(config_root(&dir.path().join("elsewhere/x.fnl")), None);
+    }
 
     #[test]
     fn platform_from_str_all_variants() {
