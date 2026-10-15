@@ -93,10 +93,12 @@ fn load_fnl(path: &std::path::Path, root: &std::path::Path) -> LuaResult<Config>
 
     let fennel: LuaTable = lua.load(FENNEL_SRC).set_name("fennel.lua").eval()?;
 
-    // Extend fennel.path so require works from the project root
+    // Extend fennel.path so require works from the project root. `.fnlm` too:
+    // a tool can ship its hooks as a module its host won't load as code (a
+    // Godot addon's .fnl files are scripts)
     let root_str = root.to_string_lossy();
     let orig_path: String = fennel.get("path").unwrap_or_default();
-    let new_path = format!("{}/?.fnl;{}/?/init.fnl;{}", root_str, root_str, orig_path);
+    let new_path = format!("{}/?.fnl;{}/?/init.fnl;{}/?.fnlm;{}", root_str, root_str, root_str, orig_path);
     log::debug!("load_fnl: fennel.path = {}", new_path);
     fennel.set("path", new_path)?;
 
@@ -210,6 +212,18 @@ mod tests {
         let names = config.global_macros.unwrap();
         assert!(names.contains(&"extend-node".to_string()));
         assert!(names.contains(&"other-macro".to_string()));
+    }
+
+    #[test]
+    fn config_requires_a_fnlm_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("addons/tool")).unwrap();
+        std::fs::write(dir.path().join("addons/tool/lsp.fnlm"),
+            r#"{:known-globals ["gd"] :global-macros {:defnode (fn [call] [])}}"#).unwrap();
+        write_lsp_fnl(dir.path(), r#"(require :addons.tool.lsp)"#);
+        let config = Config::load(dir.path());
+        assert_eq!(config.known_globals.unwrap(), vec!["gd"]);
+        assert_eq!(config.global_macros.unwrap(), vec!["defnode"]);
     }
 
     #[test]

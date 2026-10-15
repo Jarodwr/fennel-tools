@@ -54,13 +54,37 @@ Creates a local definition at the given span. The name becomes visible to comple
 
 Runs the standard analyzer on `call.children[index]`. Use this for sub-forms that are plain expressions — the analyzer will resolve identifiers and collect definitions from them.
 
+`:path` reaches a node at any depth, 1-based at each level, in place of `:index`:
+
+```fennel
+{:type :analyze :path [5 3 2]}   ; call.children[5].children[3].children[2]
+```
+
+A DSL often nests: a default inside `(group G (prop p default))` is at `[i 3 3]`. A path that doesn't lead to a node is ignored.
+
 ### `:analyze-fn` — analyze a sub-form as a function body
 
 ```fennel
 {:type :analyze-fn :index 3}
 ```
 
-Like `:analyze`, but treats the sub-form as a `fn` form. Parameters are bound into scope, the body is analyzed, and any nested `fn` definitions are collected as real symbols. Use this when a sub-form has the shape `(fn name [params] body...)`.
+Like `:analyze`, but treats the sub-form as a `fn` form. Parameters are bound into scope, the body is analyzed, and any nested `fn` definitions are collected as real symbols. Use this when a sub-form has the shape `(fn name [params] body...)`. The head symbol isn't checked, so `(method name [params] body...)` works too. It takes `:path` as `:analyze` does.
+
+`:implicit-params` binds names the form doesn't write as parameters of the function, such as a method's `self`:
+
+```fennel
+{:type :analyze-fn :path [4] :implicit-params ["self"]}
+```
+
+References to them resolve, and they're never reported as unused. Go-to-definition on one goes to the form's head.
+
+### `:skip` — leave a node unanalyzed
+
+```fennel
+{:type :skip :span node.span}
+```
+
+A later `:analyze` or `:analyze-fn` that reaches the node at that span doesn't analyze it or anything inside it. Use it for a DSL name inside an analyzed body, such as the method name in `(super take damage)`, which isn't a variable. Skips must come before the instruction that reaches the node.
 
 ### `:scope-open` / `:scope-close` — bracket a new scope
 
@@ -131,6 +155,34 @@ The module key matches the string passed to `import-macros`:
 (import-macros {: defnode} :my-project.macros)
 ;;                          ^^^^^^^^^^^^^^^^^ this string
 ```
+
+---
+
+## Global macros
+
+A macro the compiler provides to every file, with no `import-macros`, is declared under `:global-macros`, with its hook (or `true` for none):
+
+```fennel
+{:global-macros {:defnode defnode-hook :deftool defnode-hook}}
+```
+
+---
+
+## Shipping hooks with a library
+
+`.lsp.fnl` can `require` modules from the workspace root, as `.fnl` or `.fnlm` files. A library can ship its settings and hooks as one module, and a project's `.lsp.fnl` is then a single line:
+
+```fennel
+(require :addons.my_lib.lsp)   ; addons/my_lib/lsp.fnl or lsp.fnlm
+```
+
+`.fnlm` suits a host that would load a `.fnl` file as code, such as a Godot addon.
+
+---
+
+## Checking from the command line
+
+`fennel-ls check FILE…` applies the nearest `.lsp.fnl` (in the file's directory or an ancestor): its platform, `:known-globals`, `:global-docs`, `:global-macros` and hooks. It prints the same warnings the server publishes.
 
 ---
 

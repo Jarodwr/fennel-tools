@@ -104,40 +104,45 @@ impl AnalyzedFile {
     /// Find the list node (macro call) whose span starts at `byte`.
     /// Used to build a `SerialNode` for hook execution.
     pub fn find_list_at(&self, byte: u32) -> Option<&AstNode> {
-        fn search(node: &AstNode, target: u32) -> Option<&AstNode> {
-            if node.span.start == target {
-                if let crate::parser::Form::List(_) = &node.node {
-                    return Some(node);
-                }
+        find_list_at(&self.ast, byte)
+    }
+}
+
+/// Find the list node whose span starts at `byte`, at any depth of `ast`.
+pub fn find_list_at(ast: &[AstNode], byte: u32) -> Option<&AstNode> {
+    fn search(node: &AstNode, target: u32) -> Option<&AstNode> {
+        if node.span.start == target {
+            if let crate::parser::Form::List(_) = &node.node {
+                return Some(node);
             }
-            match &node.node {
-                crate::parser::Form::List(ch)
-                | crate::parser::Form::Table(ch)
-                | crate::parser::Form::Sequence(ch) => {
-                    for child in ch {
-                        if let Some(found) = search(child, target) {
-                            return Some(found);
-                        }
+        }
+        match &node.node {
+            crate::parser::Form::List(ch)
+            | crate::parser::Form::Table(ch)
+            | crate::parser::Form::Sequence(ch) => {
+                for child in ch {
+                    if let Some(found) = search(child, target) {
+                        return Some(found);
                     }
                 }
-                crate::parser::Form::Quote(inner)
-                | crate::parser::Form::Quasiquote(inner)
-                | crate::parser::Form::Unquote(inner)
-                | crate::parser::Form::UnquoteSplice(inner)
-                | crate::parser::Form::HashFn(inner) => {
-                    return search(inner, target);
-                }
-                _ => {}
             }
-            None
-        }
-        for top in &self.ast {
-            if let Some(found) = search(top, byte) {
-                return Some(found);
+            crate::parser::Form::Quote(inner)
+            | crate::parser::Form::Quasiquote(inner)
+            | crate::parser::Form::Unquote(inner)
+            | crate::parser::Form::UnquoteSplice(inner)
+            | crate::parser::Form::HashFn(inner) => {
+                return search(inner, target);
             }
+            _ => {}
         }
         None
     }
+    for top in ast {
+        if let Some(found) = search(top, byte) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 #[derive(Clone)]

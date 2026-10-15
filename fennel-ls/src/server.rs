@@ -2009,7 +2009,7 @@ impl LanguageServer for Backend {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Map a platform string from config to the Platform enum.
-fn platform_from_str(s: &str) -> Option<Platform> {
+pub(crate) fn platform_from_str(s: &str) -> Option<Platform> {
     match s {
         "lua51" => Some(Platform::Lua51),
         "lua52" => Some(Platform::Lua52),

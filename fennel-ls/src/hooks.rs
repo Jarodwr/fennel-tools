@@ -27,7 +27,19 @@
 ///
 ///   {:type "analyze-fn" :index 3}
 ///     — analyze call.children[3] as a `(fn name? [params] body...)` definition;
-///       this gives hover, go-to-def, completion, and arity-checking for free
+///       this gives hover, go-to-def, completion, and arity-checking for free.
+///       The head symbol isn't checked, so `(method name [params] body...)` works.
+///
+///   {:type "analyze" :path [5 3 2]}  /  {:type "analyze-fn" :path [5 2]}
+///     — the same for a node at any depth: call.children[5].children[3].children[2]
+///
+///   {:type "analyze-fn" :index 3 :implicit-params ["self"]}
+///     — also bind names the form doesn't write, such as a method's `self`, as
+///       parameters of that function; they never warn as unused
+///
+///   {:type "skip" :span {...}}
+///     — leave the node at that span unanalyzed when a later instruction reaches
+///       it, e.g. the method name in `(super take damage)` inside a method body
 ///
 ///   {:type "scope-open"  :span {...}}
 ///     — push a new lexical scope covering the given span
@@ -147,10 +159,17 @@ impl SerialNode {
 pub enum Instruction {
     /// Introduce a named binding at the given source span.
     Bind { name: String, span: Span },
-    /// Analyze call.children[index] as normal Fennel code (1-based).
-    Analyze { index: usize },
-    /// Analyze call.children[index] as a `(fn name? [params] body...)` form (1-based).
-    AnalyzeFn { index: usize },
+    /// Analyze the node at `path` as normal Fennel code. The path is 1-based:
+    /// `[3]` is call.children[3], `[5 3 2]` is call.children[5].children[3].children[2].
+    /// `:index n` is shorthand for `:path [n]`.
+    Analyze { path: Vec<usize> },
+    /// Analyze the node at `path` as a `(head name? [params] body...)` form.
+    /// `implicit_params` are bound in the function's scope as parameters that
+    /// aren't written in it (a method's `self`); they never warn as unused.
+    AnalyzeFn { path: Vec<usize>, implicit_params: Vec<String> },
+    /// Leave the node starting at `span` unanalyzed wherever a later instruction
+    /// reaches it (a DSL name inside an analyzed body, such as a method name).
+    Skip { span: Span },
     /// Open a new lexical scope spanning `span`.
     ScopeOpen { span: Span },
     /// Close the most recently opened scope.
@@ -169,8 +188,15 @@ impl Instruction {
                 name: t.get("name")?,
                 span: span_from_lua(&t.get::<_, LuaTable>("span")?)?
             }),
-            "analyze" => Ok(Self::Analyze { index: t.get("index")? }),
-            "analyze-fn" => Ok(Self::AnalyzeFn { index: t.get("index")? }),
+            "analyze" => Ok(Self::Analyze { path: path_from_lua(t)? }),
+            "analyze-fn" => {
+                let implicit_params = match t.get::<_, Option<LuaTable>>("implicit-params")? {
+                    Some(names) => names.sequence_values::<String>().collect::<LuaResult<_>>()?,
+                    None => vec![],
+                };
+                Ok(Self::AnalyzeFn { path: path_from_lua(t)?, implicit_params })
+            }
+            "skip" => Ok(Self::Skip { span: span_from_lua(&t.get::<_, LuaTable>("span")?)? }),
             "scope-open" => Ok(Self::ScopeOpen {
                 span: span_from_lua(&t.get::<_, LuaTable>("span")?)?
             }),
@@ -192,6 +218,19 @@ impl Instruction {
             )),
         }
     }
+}
+
+/// `:path [i j …]`, or `:index i` as `[i]`
+fn path_from_lua(t: &LuaTable) -> LuaResult<Vec<usize>> {
+    if let Some(path) = t.get::<_, Option<LuaTable>>("path")? {
+        let path: Vec<usize> = path.sequence_values::<usize>().collect::<LuaResult<_>>()?;
+        if path.is_empty() || path.contains(&0) {
+            return Err(LuaError::RuntimeError("a hook path is 1-based and not empty".into()));
+        }
+        return Ok(path);
+    }
+    let index: usize = t.get("index")?;
+    Ok(vec![index])
 }
 
 fn span_from_lua(t: &LuaTable) -> LuaResult<Span> {
@@ -234,7 +273,8 @@ function register_hooks(src, search_path)
     local orig_macro_path = fennel["macro-path"]
     if search_path and search_path ~= "" then
         local prefix = search_path .. "/?.fnl;" .. search_path .. "/?/init.fnl;"
-        fennel.path = prefix .. orig_path
+        -- .fnlm too, as config.rs's load_fnl searches
+        fennel.path = prefix .. search_path .. "/?.fnlm;" .. orig_path
         fennel["macro-path"] = prefix .. orig_macro_path
     end
     -- Snapshot package.loaded so modules required during eval don't persist
@@ -567,7 +607,28 @@ mod tests {
         let lua = make_lua();
         register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze\" :index 2}])}}");
         let result = run(&lua, "", "m", &dummy_call()).unwrap();
-        assert!(matches!(result[0], Instruction::Analyze { index: 2 }));
+        assert!(matches!(&result[0], Instruction::Analyze { path } if path == &vec![2]));
+    }
+
+    #[test]
+    fn path_and_implicit_params_round_trip() {
+        let lua = make_lua();
+        register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze\" :path [5 3 2]}
+                                                   {:type \"analyze-fn\" :path [4] :implicit-params [\"self\"]}
+                                                   {:type \"skip\" :span {:start 3 :end 7 :line 0 :col 3}}])}}");
+        let result = run(&lua, "", "m", &dummy_call()).unwrap();
+        assert!(matches!(&result[0], Instruction::Analyze { path } if path == &vec![5, 3, 2]));
+        assert!(matches!(&result[1], Instruction::AnalyzeFn { path, implicit_params }
+            if path == &vec![4] && implicit_params == &vec!["self".to_string()]));
+        assert!(matches!(&result[2], Instruction::Skip { span } if span.start == 3));
+    }
+
+    #[test]
+    fn a_zero_path_index_is_rejected() {
+        let lua = make_lua();
+        register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze\" :path [0]}])}}");
+        let result = run(&lua, "", "m", &dummy_call()).unwrap();
+        assert!(result.is_empty(), "a bad instruction is dropped");
     }
 
     #[test]
@@ -575,7 +636,7 @@ mod tests {
         let lua = make_lua();
         register(&lua, "{:macro-hooks {:m (fn [_] [{:type \"analyze-fn\" :index 3}])}}");
         let result = run(&lua, "", "m", &dummy_call()).unwrap();
-        assert!(matches!(result[0], Instruction::AnalyzeFn { index: 3 }));
+        assert!(matches!(&result[0], Instruction::AnalyzeFn { path, .. } if path == &vec![3]));
     }
 
     #[test]
